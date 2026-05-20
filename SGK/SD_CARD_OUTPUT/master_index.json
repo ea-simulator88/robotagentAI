@@ -1,0 +1,56 @@
+{
+  "version": "1.0",
+  "description": "SGK Index cho Robot AI",
+  "subjects": {
+    "tiengviet_l1_t1": {
+      "subject": "tiengviet",
+      "subject_name": "Tiếng Việt",
+      "grade": 1,
+      "tap": 1,
+      "total_pages": 189,
+      "lesson_count": 183,
+      "path": "sgk/tiengviet_l1_t1",
+      "index_file": "sgk/tiengviet_l1_t1/index.json"
+    },
+    "tiengviet_l1_t2": {
+      "subject": "tiengviet",
+      "subject_name": "Tiếng Việt",
+      "grade": 1,
+      "tap": 2,
+      "total_pages": 165,
+      "lesson_count": 159,
+      "path": "sgk/tiengviet_l1_t2",
+      "index_file": "sgk/tiengviet_l1_t2/index.json"
+    },
+    "tiengviet_l2_t1": {
+      "subject": "tiengviet",
+      "subject_name": "Tiếng Việt",
+      "grade": 2,
+      "tap": 1,
+      "total_pages": 157,
+      "lesson_count": 151,
+      "path": "sgk/tiengviet_l2_t1",
+      "index_file": "sgk/tiengviet_l2_t1/index.json"
+    },
+    "toan_l1_t1": {
+      "subject": "toan",
+      "subject_name": "Toán",
+      "grade": 1,
+      "tap": 1,
+      "total_pages": 161,
+      "lesson_count": 155,
+      "path": "sgk/toan_l1_t1",
+      "index_file": "sgk/toan_l1_t1/index.json"
+    },
+    "toan_l2_t1": {
+      "subject": "toan",
+      "subject_name": "Toán",
+      "grade": 2,
+      "tap": 1,
+      "total_pages": 133,
+      "lesson_count": 127,
+      "path": "sgk/toan_l2_t1",
+      "index_file": "sgk/toan_l2_t1/index.json"
+    }
+  }
+}
