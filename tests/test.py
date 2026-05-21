@@ -55,6 +55,13 @@ from py.alarm_manager import (
 from py.alarm_parser import build_chat_system_prompt, parse_intent
 from py.memory import ConversationMemory
 from py.search import brave_search, format_for_llm as format_search_for_llm
+from py.sgk_teacher import (
+    SGK_DIR,
+    build_vision_user_content,
+    find_relevant_pages,
+    load_master_index,
+    render_sgk_system_prompt,
+)
 from py.common import (
     ALL_LANG_CODES,
     DEEPSEEK_API_KEY,
@@ -72,6 +79,10 @@ from py.common import (
 )
 
 DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+# Vision model cho SGK pipeline. DeepSeek-chat (V3) là text-only, không nhận
+# image_url content → phải dùng Groq Llama-4 Scout (vision-capable, OpenAI-
+# compatible) cho câu hỏi học bài có ảnh SGK đính kèm.
+GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 ALARMS_PATH = TMP_DIR / "alarms.json"
 ALARM_TONE = TMP_DIR / "alarm_tone.wav"
 CHAT_HISTORY_PATH = TMP_DIR / "chat_history.json"
@@ -224,6 +235,10 @@ def llm(
         json=payload,
         timeout=45,
     )
+    if r.status_code >= 400:
+        # In ra body để biết DeepSeek phàn nàn gì (vd. content type không hỗ trợ).
+        snippet = (r.text or "")[:500]
+        print(f"  ⚠ DeepSeek HTTP {r.status_code}: {snippet}")
     r.raise_for_status()
     body = r.json()
     choice = (body.get("choices") or [{}])[0]
@@ -241,6 +256,39 @@ def llm(
                 print(f"      ↪ Dùng tạm '{alt}' làm content.")
                 return val.strip()
     return content.strip()
+
+
+def llm_vision(
+    client: Groq,
+    messages: list[dict],
+    temperature: float = 0.6,
+    max_tokens: int = 2000,
+) -> str:
+    """Vision LLM qua Groq (Llama-4 Scout). DeepSeek-chat không support image_url
+    content nên SGK pipeline phải dùng provider khác. Groq client đã có sẵn
+    (dùng chung với Whisper STT) → tiết kiệm 1 dependency.
+
+    max_tokens=2000 để có chỗ ĐỌC NGUYÊN VĂN cả bài SGK khi bạn ấy yêu cầu
+    "đọc hết bài" (1 trang SGK lớp 2 ~ 200-400 từ × ~1.7 token/từ tiếng Việt
+    + buffer cho câu hỏi ngược cuối + JSON wrapper).
+
+    KHÔNG dùng json_object response_format vì Groq Llama vision không bảo đảm
+    hỗ trợ. System prompt đã yêu cầu output JSON → model sẽ tự tuân thủ, và
+    parse_tts_segments có fallback cho plain text."""
+    try:
+        resp = client.chat.completions.create(
+            model=GROQ_VISION_MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except Exception as e:
+        print(f"  ⚠ Groq vision lỗi: {type(e).__name__}: {e}")
+        return ""
+    try:
+        return (resp.choices[0].message.content or "").strip()
+    except (AttributeError, IndexError):
+        return ""
 
 
 def tts(voice: str, text: str, out: Path, retries: int = 2) -> Path:
@@ -512,24 +560,87 @@ def segments_to_text(segments: list[dict[str, str]]) -> str:
     return " ".join(s["text"] for s in segments if s.get("text")).strip()
 
 
+def _split_long_tts_text(text: str, max_chars: int = 250) -> list[str]:
+    """Cắt text dài theo ranh giới câu để Edge TTS không trả NoAudioReceived.
+
+    Edge TTS server đôi khi từ chối các text quá dài (vài trăm ký tự trở lên,
+    đặc biệt với giọng vi-VN) — trả về NoAudioReceived dù retry. Cắt theo dấu
+    câu (. ! ? …) trước, nếu chunk vẫn dài thì cắt tiếp theo dấu phẩy.
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+
+    sentences = re.split(r"(?<=[.!?…])\s+", text)
+    chunks: list[str] = []
+    cur = ""
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if not cur:
+            cur = s
+        elif len(cur) + 1 + len(s) <= max_chars:
+            cur = cur + " " + s
+        else:
+            chunks.append(cur)
+            cur = s
+    if cur:
+        chunks.append(cur)
+
+    # Câu siêu dài (không có dấu chấm) → cắt thêm theo dấu phẩy / chấm phẩy.
+    final: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            final.append(chunk)
+            continue
+        parts = re.split(r"(?<=[,;])\s+", chunk)
+        cur = ""
+        for p in parts:
+            p = p.strip()
+            if not p:
+                continue
+            if not cur:
+                cur = p
+            elif len(cur) + 1 + len(p) <= max_chars:
+                cur = cur + " " + p
+            else:
+                final.append(cur)
+                cur = p
+        if cur:
+            final.append(cur)
+    return final
+
+
 def synth_tts_segments(
     segments: list[dict[str, str]], prefix: str
 ) -> list[tuple[Path, str, str]]:
     rendered: list[tuple[Path, str, str]] = []
-    for idx, segment in enumerate(segments, start=1):
+    file_idx = 0
+    for seg_idx, segment in enumerate(segments, start=1):
         lang = segment["lang"]
         voice = LANGS[lang]["voice_id"]
         spoken = strip_for_tts(segment["text"])
         if not spoken:
             continue
-        out = TMP_DIR / f"{prefix}_{idx}_{lang}.mp3"
-        print(f"  🔊 TTS segment {idx}: lang={lang} voice={voice}")
-        try:
-            tts(voice, spoken, out)
-        except Exception as e:
-            print(f"  ⚠ Edge TTS lỗi ở segment {idx} ({type(e).__name__}: {e}) — bỏ qua.")
-            continue
-        rendered.append((out, lang, spoken))
+        # Cắt nhỏ trước khi gọi Edge TTS để tránh NoAudioReceived ở text dài.
+        chunks = _split_long_tts_text(spoken)
+        for chunk_idx, chunk in enumerate(chunks, start=1):
+            file_idx += 1
+            out = TMP_DIR / f"{prefix}_{file_idx}_{lang}.mp3"
+            print(
+                f"  🔊 TTS seg {seg_idx}.{chunk_idx}: lang={lang} voice={voice}"
+                f" ({len(chunk)} chars)"
+            )
+            try:
+                tts(voice, chunk, out)
+            except Exception as e:
+                print(
+                    f"  ⚠ Edge TTS lỗi ở seg {seg_idx}.{chunk_idx} "
+                    f"({type(e).__name__}: {e}) — bỏ qua chunk này."
+                )
+                continue
+            rendered.append((out, lang, chunk))
     return rendered
 
 
@@ -740,57 +851,97 @@ def one_round(
                 print(f"  ⚠ Brave Search fail: {type(e).__name__}: {e}")
                 search_context = "(không tìm được kết quả)"
 
-    if not intent_handled:
-        sys_prompt = build_chat_system_prompt(
-            cfg["system_prompt"],
-            datetime.now(),
-            alarm_mgr.format_for_prompt(detected_key),
-            user_name=profile.get("name", "bạn"),
-            language=detected_key,
-        )
-        # Nếu có search_context → chèn vào user message để LLM tổng hợp từ kết quả thật,
-        # không dùng training data (vốn outdated).
-        if search_context:
-            instr = {
-                "vi": "Dùng các kết quả trên để trả lời ngắn gọn, tự nhiên bằng tiếng Việt.",
-                "en": "Use the above results to answer briefly and naturally in English.",
-                "zh": "请根据上面的结果，用简短自然的中文（普通话）回答。",
-                "yue": "請根據上面嘅結果，用簡短自然嘅廣東話回答。",
-            }.get(detected_key, "Dùng các kết quả trên để trả lời ngắn gọn.")
-            user_content = (
-                f"{transcript}\n\n"
-                f"--- Search results (latest web) ---\n{search_context}\n---\n\n"
-                f"{instr}"
+    # SGK lookup — chỉ làm khi intent là chat thường (không alarm/search), để
+    # dành vision API cho câu hỏi học bài.
+    sgk_pages: list[dict] = []
+    if not intent_handled and not search_context and detected_key == "vi":
+        try:
+            master_idx = load_master_index(SGK_DIR)
+            sgk_pages = find_relevant_pages(transcript, master_idx, SGK_DIR, max=2)
+        except FileNotFoundError:
+            pass  # SGK chưa setup → bỏ qua, dùng chat thường
+        except Exception as e:
+            print(f"  ⚠ SGK lookup fail: {type(e).__name__}: {e}")
+        if sgk_pages:
+            head = sgk_pages[0]
+            pages_str = ", ".join("trang " + str(p["page"]) for p in sgk_pages)
+            print(
+                f"  📖 SGK: {head['subject_name']} lớp {head['grade']}"
+                f" tập {head.get('tap', '?')} — {pages_str}"
             )
-            # Không gửi history khi search — context đã đủ, tránh nhiễu
-            messages = [
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_content},
-            ]
-        else:
+
+    if not intent_handled:
+        if sgk_pages:
+            # SGK teacher mode: vision message với ảnh SGK + system prompt cô giáo
+            sys_prompt = render_sgk_system_prompt(
+                ten=profile.get("name", "bé"),
+                lop=profile.get("grade", 2),
+            )
+            user_content = build_vision_user_content(transcript, sgk_pages)
+            # History chỉ chứa text (memory.add_user lưu transcript text, không có
+            # base64) → không lo blow up token cho lượt sau.
             messages = [
                 {"role": "system", "content": sys_prompt},
                 *memory.for_llm(),
-                {"role": "user", "content": transcript},
+                {"role": "user", "content": user_content},
             ]
+        else:
+            sys_prompt = build_chat_system_prompt(
+                cfg["system_prompt"],
+                datetime.now(),
+                alarm_mgr.format_for_prompt(detected_key),
+                user_name=profile.get("name", "bạn"),
+                language=detected_key,
+            )
+            # Nếu có search_context → chèn vào user message để LLM tổng hợp từ kết quả thật,
+            # không dùng training data (vốn outdated).
+            if search_context:
+                instr = {
+                    "vi": "Dùng các kết quả trên để trả lời ngắn gọn, tự nhiên bằng tiếng Việt.",
+                    "en": "Use the above results to answer briefly and naturally in English.",
+                    "zh": "请根据上面的结果，用简短自然的中文（普通话）回答。",
+                    "yue": "請根據上面嘅結果，用簡短自然嘅廣東話回答。",
+                }.get(detected_key, "Dùng các kết quả trên để trả lời ngắn gọn.")
+                user_content = (
+                    f"{transcript}\n\n"
+                    f"--- Search results (latest web) ---\n{search_context}\n---\n\n"
+                    f"{instr}"
+                )
+                # Không gửi history khi search — context đã đủ, tránh nhiễu
+                messages = [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_content},
+                ]
+            else:
+                messages = [
+                    {"role": "system", "content": sys_prompt},
+                    *memory.for_llm(),
+                    {"role": "user", "content": transcript},
+                ]
         with stopwatch("LLM", timings):
-            answer = llm(messages)
-            if not (answer or "").strip():
-                print("  ⚠ LLM rỗng — retry 1: temp=0.2 + json_object.")
-                try:
-                    answer = llm(messages, temperature=0.2)
-                except Exception as e:
-                    print(f"  ⚠ Retry 1 fail: {type(e).__name__}: {e}")
-                    answer = ""
-            if not (answer or "").strip():
-                # DeepSeek json_object mode đôi khi bị kẹt sinh ra ' ' rồi stop.
-                # Bỏ json_mode → model tự do trả text; splitter Python sẽ tự chia segment.
-                print("  ⚠ LLM rỗng — retry 2: bỏ json_object mode.")
-                try:
-                    answer = llm(messages, temperature=0.5, json_mode=False)
-                except Exception as e:
-                    print(f"  ⚠ Retry 2 fail: {type(e).__name__}: {e}")
-                    answer = ""
+            if sgk_pages:
+                # SGK pipeline → Groq vision. DeepSeek-chat không nhận image_url.
+                answer = llm_vision(client, messages)
+                if not (answer or "").strip():
+                    print("  ⚠ Vision LLM rỗng — không có retry strategy riêng.")
+            else:
+                answer = llm(messages)
+                if not (answer or "").strip():
+                    print("  ⚠ LLM rỗng — retry 1: temp=0.2 + json_object.")
+                    try:
+                        answer = llm(messages, temperature=0.2)
+                    except Exception as e:
+                        print(f"  ⚠ Retry 1 fail: {type(e).__name__}: {e}")
+                        answer = ""
+                if not (answer or "").strip():
+                    # DeepSeek json_object mode đôi khi bị kẹt sinh ra ' ' rồi stop.
+                    # Bỏ json_mode → model tự do trả text; splitter Python sẽ tự chia segment.
+                    print("  ⚠ LLM rỗng — retry 2: bỏ json_object mode.")
+                    try:
+                        answer = llm(messages, temperature=0.5, json_mode=False)
+                    except Exception as e:
+                        print(f"  ⚠ Retry 2 fail: {type(e).__name__}: {e}")
+                        answer = ""
         if not (answer or "").strip():
             print("  ⚠ LLM vẫn rỗng — dùng câu xin lỗi mặc định.")
             answer = json.dumps(
