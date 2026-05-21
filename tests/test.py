@@ -59,9 +59,11 @@ from py.sgk_teacher import (
     SGK_DIR,
     build_vision_user_content,
     find_relevant_pages,
+    load_lessons,
     load_master_index,
     render_sgk_system_prompt,
 )
+from py.sgk_progress import SGKProgress, format_progress_note
 from py.common import (
     ALL_LANG_CODES,
     DEEPSEEK_API_KEY,
@@ -86,6 +88,7 @@ GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 ALARMS_PATH = TMP_DIR / "alarms.json"
 ALARM_TONE = TMP_DIR / "alarm_tone.wav"
 CHAT_HISTORY_PATH = TMP_DIR / "chat_history.json"
+SGK_PROGRESS_PATH = TMP_DIR / "sgk_progress.json"
 CHAT_MAX_TURNS = 12  # số cặp gửi cho LLM mỗi lần (đĩa lưu vô tận)
 
 # Whisper verbose_json trả về tên ngôn ngữ dạng English lowercase
@@ -744,6 +747,7 @@ def one_round(
     alarm_mgr: AlarmManager,
     profile: dict,
     memory: ConversationMemory,
+    sgk_progress: SGKProgress,
     use_vad: bool = True,
 ) -> dict:
     is_auto = lang_key == "auto"
@@ -854,10 +858,14 @@ def one_round(
     # SGK lookup — chỉ làm khi intent là chat thường (không alarm/search), để
     # dành vision API cho câu hỏi học bài.
     sgk_pages: list[dict] = []
+    sgk_next_lesson: dict | None = None
+    sgk_master_idx: dict | None = None
     if not intent_handled and not search_context and detected_key == "vi":
         try:
-            master_idx = load_master_index(SGK_DIR)
-            sgk_pages = find_relevant_pages(transcript, master_idx, SGK_DIR, max=2)
+            sgk_master_idx = load_master_index(SGK_DIR)
+            sgk_pages = find_relevant_pages(
+                transcript, sgk_master_idx, SGK_DIR, max=2
+            )
         except FileNotFoundError:
             pass  # SGK chưa setup → bỏ qua, dùng chat thường
         except Exception as e:
@@ -869,13 +877,44 @@ def one_round(
                 f"  📖 SGK: {head['subject_name']} lớp {head['grade']}"
                 f" tập {head.get('tap', '?')} — {pages_str}"
             )
+            # Tính bài kế tiếp trong sách dựa vào tiến độ đã ghi nhận
+            if sgk_master_idx is not None:
+                try:
+                    lessons = load_lessons(
+                        sgk_master_idx, SGK_DIR,
+                        head["subject"], head["grade"], head.get("tap"),
+                    )
+                    sgk_next_lesson = sgk_progress.next_lesson(
+                        head["subject"], head["grade"], head.get("tap"), lessons,
+                    )
+                except Exception as e:
+                    print(f"  ⚠ SGK next_lesson fail: {type(e).__name__}: {e}")
+            prev = sgk_progress.latest_before_today()
+            if prev:
+                print(
+                    f"  🧠 Buổi trước ({prev.get('date')}): "
+                    f"{prev.get('subject')} lớp {prev.get('grade')} "
+                    f"trang {prev.get('page')}"
+                )
+            if sgk_next_lesson:
+                nxt_p = (
+                    sgk_next_lesson.get("book_page")
+                    or sgk_next_lesson.get("pdf_page")
+                )
+                print(f"  ➡️  Bài kế tiếp đề xuất: trang {nxt_p}")
 
     if not intent_handled:
         if sgk_pages:
             # SGK teacher mode: vision message với ảnh SGK + system prompt cô giáo
+            progress_note = format_progress_note(
+                sgk_progress,
+                current_pages=sgk_pages,
+                next_lesson=sgk_next_lesson,
+            )
             sys_prompt = render_sgk_system_prompt(
                 ten=profile.get("name", "bé"),
                 lop=profile.get("grade", 2),
+                progress_note=progress_note,
             )
             user_content = build_vision_user_content(transcript, sgk_pages)
             # History chỉ chứa text (memory.add_user lưu transcript text, không có
@@ -973,6 +1012,23 @@ def one_round(
     )
     memory.add_assistant(assistant_json)
 
+    # Ghi tiến độ học SGK: 1 entry / trang đã hỏi trong lượt này.
+    # Chỉ ghi khi (1) đã đi vào SGK path, (2) AI trả lời thực (không phải fallback
+    # xin lỗi). Dedupe theo (date, subject, grade, tap, page) — học lại cùng trang
+    # trong ngày sẽ không tạo entry trùng.
+    if sgk_pages and display_answer and display_answer != "(không có nội dung)":
+        for p in sgk_pages:
+            try:
+                sgk_progress.record(
+                    subject=p["subject"],
+                    grade=p["grade"],
+                    tap=p.get("tap"),
+                    page=p["page"],
+                    page_label=f"trang {p['page']}",
+                )
+            except Exception as e:
+                print(f"  ⚠ SGK record fail: {type(e).__name__}: {e}")
+
     print(f"  🤖 AI   : {display_answer}")
 
     with stopwatch("TTS", timings):
@@ -1036,6 +1092,24 @@ def run_pipeline(args, profile: dict) -> None:
     else:
         print(f"  🧠 Memory rỗng. File: {CHAT_HISTORY_PATH}")
 
+    # Tiến độ học SGK — persist qua JSON, để AI nhắc lại bài cũ + gợi ý bài kế.
+    sgk_progress = SGKProgress(SGK_PROGRESS_PATH)
+    if args.forget:
+        sgk_progress.clear()
+        print("  📚 SGK progress đã được xóa theo --forget.")
+    elif len(sgk_progress) > 0:
+        prev = sgk_progress.latest_before_today()
+        if prev:
+            print(
+                f"  📚 SGK progress: {len(sgk_progress)} bài trên đĩa. "
+                f"Buổi trước ({prev.get('date')}): {prev.get('subject')} "
+                f"lớp {prev.get('grade')} trang {prev.get('page')}."
+            )
+        else:
+            print(f"  📚 SGK progress: {len(sgk_progress)} bài (tất cả hôm nay).")
+    else:
+        print(f"  📚 SGK progress rỗng. File: {SGK_PROGRESS_PATH}")
+
     alarm_mgr = AlarmManager(
         path=ALARMS_PATH,
         on_trigger=make_alarm_trigger_callback(profile),
@@ -1053,6 +1127,7 @@ def run_pipeline(args, profile: dict) -> None:
                 i += 1
                 result = one_round(
                     client, args.lang, args.seconds, i, alarm_mgr, profile, memory,
+                    sgk_progress,
                     use_vad=not args.no_vad,
                 )
                 if result:
@@ -1061,6 +1136,7 @@ def run_pipeline(args, profile: dict) -> None:
             for i in range(1, args.rounds + 1):
                 result = one_round(
                     client, args.lang, args.seconds, i, alarm_mgr, profile, memory,
+                    sgk_progress,
                     use_vad=not args.no_vad,
                 )
                 if result:
