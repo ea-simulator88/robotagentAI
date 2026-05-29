@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"import ast; ast.parse\\(open\\('py/sgk_teacher.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('py/sgk_teacher.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(\"C:/Users/HP/.platformio/penv/Scripts/pio.exe\" run:*)",
+      "Bash(pip install:*)"
     ]
   }
 }

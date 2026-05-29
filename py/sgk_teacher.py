@@ -28,6 +28,21 @@ SGK_DIR = ROOT / "SGK" / "SD_CARD_OUTPUT"
 
 
 # =============================================================
+#  TOC (Mục lục) — trang nào của mỗi cuốn là MỤC LỤC
+# =============================================================
+# Khi bé hỏi "bài N" (không phải "trang N"), không biết bài đó ở trang nào
+# → gửi ảnh TOC + câu hỏi sang vision API để AI đọc mục lục và trả về số trang.
+# Số ở đây là PDF page number (= số trong tên file page_NNN.jpg).
+TOC_PAGES: dict[str, list[int]] = {
+    "tiengviet_l1_t1": [4, 5],
+    "tiengviet_l1_t2": [4, 5],
+    "tiengviet_l2_t1": [4, 5, 6, 7, 8, 9],
+    "toan_l1_t1": [4, 5],
+    "toan_l2_t1": [5],
+}
+
+
+# =============================================================
 #  SYSTEM PROMPT — Cô giáo tiểu học theo SGK
 # =============================================================
 # Dùng placeholder [TEN], [LOP] thay cho .format() để tránh xung đột với
@@ -45,6 +60,8 @@ NỘI DUNG GIẢNG (quan trọng):
 - Ngôn ngữ đơn giản phù hợp lớp [LOP] — câu rõ ràng, từ phổ thông.
 - Nếu trong ảnh không có thứ bạn ấy hỏi → nói thật: "Trang này mình chưa thấy phần đó,
   mình lật trang khác nhé."
+- Nếu bạn ấy hỏi theo SỐ BÀI (vd "bài 5"), ảnh đính kèm là TRANG đã được tra
+  từ mục lục → giảng đúng bài đó. Nhắc rõ tên bài: "Bài 5 trang X có tên là ... nha bạn".
 
 ĐỘ DÀI CÂU TRẢ LỜI (LINH HOẠT theo yêu cầu — đây là rule quan trọng nhất):
 - Nếu bạn ấy YÊU CẦU "đọc hết bài", "đọc cả bài", "đọc toàn bộ", "đọc lại bài",
@@ -200,9 +217,16 @@ def _detect_grade(question: str, default: int = 2) -> int:
 
 
 _PAGE_KW_RE = re.compile(
-    # Whisper hay nhầm âm tiếng Việt: "trang" → "trên/tràng/tráng/trảng/chăng",
-    # "bài" → "bay/bày/bại". Mở rộng keyword để cover lỗi STT thường gặp.
-    r"(?:trang|tràng|tráng|trảng|trên|chăng|bài|bay|bày|bại|page)"
+    # CHỈ bắt "trang N" — biến thể STT mishears: trên/tràng/tráng/trảng/chăng.
+    # KHÔNG bắt "bài N" nữa — đó là số BÀI HỌC (lesson), tra qua TOC riêng.
+    r"(?:trang|tràng|tráng|trảng|trên|chăng|page)"
+    r"\s*(?:số\s+)?(\d{1,3})",
+    re.IGNORECASE,
+)
+_LESSON_KW_RE = re.compile(
+    # "bài N" + STT mishears (Whisper hay nghe nhầm "bài" thành "bay/bày/bại").
+    # Đây là SỐ THỨ TỰ BÀI HỌC, cần tra mục lục để biết trang.
+    r"(?:bài|bay|bày|bại)"
     r"\s*(?:số\s+)?(\d{1,3})",
     re.IGNORECASE,
 )
@@ -225,6 +249,11 @@ _NOT_PAGE_PREFIXES = (
     "và",
     "cho",
     "bằng",
+    # "bài" + STT mishears — số sau "bài" là LESSON, không phải PAGE.
+    "bài",
+    "bay",
+    "bày",
+    "bại",
     "+",
     "-",
     "×",
@@ -284,6 +313,86 @@ def _detect_page_number(question: str) -> int | None:
     return None
 
 
+def _detect_lesson_number(question: str) -> int | None:
+    """Bắt 'bài N' — số BÀI HỌC, cần tra mục lục để biết trang.
+
+    Khác với `_detect_page_number()` chỉ bắt 'trang N': hàm này bắt cụm
+    "bài N" hoặc các biến thể STT mishears ("bay/bày/bại N"). Trả None nếu
+    không có pattern → caller sẽ dùng page number / fallback.
+    """
+    m = _LESSON_KW_RE.search(question.lower())
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 200:
+            return n
+    return None
+
+
+# Từ khoá rõ ràng bé đang nói chuyện về SGK (dù có thể thiếu môn). Dùng để
+# phân biệt câu "giảng bài lớp 1 tập 1 bài 20" (SGK intent, cần subject fallback)
+# với "kể chuyện về con mèo" (không phải SGK, để chat thường xử lý).
+_SGK_INTENT_HINTS = (
+    "bài ", "trang ", "lớp ", "lop ",
+    "tập ", "tap ",
+    "giảng", "học bài", "đọc bài", "đọc sách",
+    "sách giáo khoa", "sgk", "mục lục",
+)
+
+
+def has_sgk_intent(question: str) -> bool:
+    """True nếu câu hỏi rõ ràng nhắc đến SGK (bài/trang/lớp/tập/giảng/...).
+    Dùng để quyết định fallback subject từ progress thay vì fall qua chat mode
+    + hallucinate."""
+    q = question.lower()
+    return any(h in q for h in _SGK_INTENT_HINTS)
+
+
+def detect_subject(question: str) -> str | None:
+    """Public wrapper cho `_detect_subject` để test.py dùng trực tiếp."""
+    return _detect_subject(question)
+
+
+# Từ tiếp diễn — bé hỏi câu nối với bài đang học, không đổi sách/trang.
+# VD "Còn các hình khác thì sao?", "Còn cái nữa", "Ngoài ra cái gì khác?"
+_CONTINUATION_HINTS = (
+    "còn", "thì sao", "ngoài ra", "khác",
+    "thêm", "nữa", "tiếp", "kế tiếp", "vậy còn",
+)
+
+
+def has_continuation_hint(question: str) -> bool:
+    """Câu hỏi mang ý 'tiếp tục/hỏi thêm về bài đang học' không."""
+    q = question.lower()
+    return any(h in q for h in _CONTINUATION_HINTS)
+
+
+def has_explicit_page_or_lesson(question: str) -> bool:
+    """True nếu câu hỏi nhắc trực tiếp số trang/bài (bài N / trang N / page N
+    + STT mishears). Dùng phân biệt yêu cầu MỚI vs câu follow-up."""
+    return (
+        _PAGE_KW_RE.search(question) is not None
+        or _LESSON_KW_RE.search(question) is not None
+    )
+
+
+def find_book_key(
+    master_index: dict[str, Any],
+    subject: str,
+    grade: int,
+    tap: int | None,
+) -> str | None:
+    """Tìm book_key (vd 'tiengviet_l2_t1') từ subject+grade+tap. Trả None nếu
+    không tồn tại trong master_index."""
+    for k, v in master_index.get("subjects", {}).items():
+        if (
+            v.get("subject") == subject
+            and v.get("grade") == grade
+            and v.get("tap") == tap
+        ):
+            return k
+    return None
+
+
 # =============================================================
 #  Tìm trang JPG liên quan
 # =============================================================
@@ -313,6 +422,12 @@ def find_relevant_pages(
 
     grade = _detect_grade(question, default=default_grade)
     page_num = _detect_page_number(question)
+    lesson_num = _detect_lesson_number(question)
+
+    # "bài N" mà không có "trang N" → KHÔNG fallback "bài đầu". Trả [] để caller
+    # gọi find_toc_lookup() lấy ảnh mục lục, dùng vision tra ra trang thật.
+    if lesson_num is not None and page_num is None:
+        return []
 
     # Tìm book khớp (subject + grade). Nếu không có grade khớp → fallback bất kỳ
     # tập nào cùng môn (vd hỏi lớp 3 toán nhưng chỉ có lớp 1, 2).
@@ -384,6 +499,135 @@ def find_relevant_pages(
             }
         )
     return out
+
+
+# =============================================================
+#  TOC lookup — tra mục lục khi user nói "bài N"
+# =============================================================
+def _find_book(
+    master_index: dict[str, Any], subject: str, grade: int,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Trả (book_key, info) — cuốn khớp subject+grade. Fallback: cùng môn,
+    bất kỳ lớp/tập (vd hỏi lớp 3 mà chỉ có lớp 1, 2)."""
+    subjects = master_index.get("subjects", {})
+    for key, info in subjects.items():
+        if info.get("subject") == subject and info.get("grade") == grade:
+            return key, info
+    for key, info in subjects.items():
+        if info.get("subject") == subject:
+            return key, info
+    return None, None
+
+
+def find_toc_lookup(
+    question: str,
+    master_index: dict[str, Any],
+    sgk_dir: Path | str = SGK_DIR,
+    default_grade: int = 2,
+) -> dict[str, Any] | None:
+    """Khi user nói 'bài N' mà chưa có 'trang N' → trả info để vision tra mục lục.
+
+    Caller (test.py) sẽ:
+      1. Gửi `toc_pages` + câu hỏi "Bài N ở trang nào?" lên Groq vision
+      2. Parse số trang AI trả về
+      3. Dùng `load_page_by_book_page()` để load đúng JPG bài đó
+
+    Trả None nếu:
+      - Không detect được lesson_number ('bài N')
+      - Không detect được môn (toán/tiếng việt)
+      - Cuốn này không có cấu hình TOC_PAGES
+    """
+    subject = _detect_subject(question)
+    if subject is None:
+        return None
+    lesson_num = _detect_lesson_number(question)
+    if lesson_num is None:
+        return None
+
+    grade = _detect_grade(question, default=default_grade)
+    book_key, book_info = _find_book(master_index, subject, grade)
+    if book_info is None or book_key is None:
+        return None
+
+    toc_page_nums = TOC_PAGES.get(book_key, [])
+    if not toc_page_nums:
+        return None
+
+    sgk_dir = Path(sgk_dir)
+    book_dir = sgk_dir / book_info["path"]
+    toc_pages: list[dict[str, Any]] = []
+    for p in toc_page_nums:
+        file_name = f"page_{p:03d}.jpg"
+        path = book_dir / file_name
+        if path.exists():
+            toc_pages.append({"path": path, "file": file_name, "pdf_page": p})
+
+    if not toc_pages:
+        return None
+
+    return {
+        "lesson_number": lesson_num,
+        "toc_pages": toc_pages,
+        "subject": subject,
+        "subject_name": book_info.get("subject_name", subject),
+        "grade": book_info.get("grade", grade),
+        "tap": book_info.get("tap"),
+        "book_key": book_key,
+    }
+
+
+def load_page_by_book_page(
+    master_index: dict[str, Any],
+    sgk_dir: Path | str,
+    book_key: str,
+    book_page: int,
+    lesson_number: int | None = None,
+) -> list[dict[str, Any]]:
+    """Sau khi vision tra mục lục biết bài N ở trang Y → load đúng JPG đó.
+
+    `book_page` là số trang in trên sách (bé đọc trong TOC). Ưu tiên qua
+    `book_pages` map của index.json (book_page → pdf_page); nếu không có map
+    thì giả định book_page == pdf_page.
+
+    Trả list 1 dict (cùng format như `find_relevant_pages`) hoặc [] nếu fail.
+    """
+    sgk_dir = Path(sgk_dir)
+    info = master_index.get("subjects", {}).get(book_key)
+    if not info:
+        return []
+    try:
+        book_index = _load_subject_index(sgk_dir, info)
+    except Exception:
+        return []
+
+    book_dir = sgk_dir / info["path"]
+    book_pages_map = book_index.get("book_pages", {})
+    pages_dict = book_index.get("pages", {})
+
+    pdf_p = book_pages_map.get(str(book_page)) or book_page
+    if str(pdf_p) not in pages_dict:
+        return []
+    meta = pages_dict[str(pdf_p)]
+    file_name = meta.get("file")
+    if not file_name:
+        return []
+    full_path = book_dir / file_name
+    if not full_path.exists():
+        return []
+
+    src = f"bài {lesson_number}" if lesson_number else f"trang {book_page}"
+    return [{
+        "path": full_path,
+        "file": file_name,
+        "subject": info.get("subject"),
+        "subject_name": info.get("subject_name"),
+        "grade": info.get("grade"),
+        "tap": info.get("tap"),
+        "page": meta.get("book_page") or int(pdf_p),
+        "pdf_page": int(pdf_p),
+        "source": src,
+        "lesson_number": lesson_number,
+    }]
 
 
 # =============================================================

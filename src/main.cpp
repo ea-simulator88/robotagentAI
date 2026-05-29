@@ -18,34 +18,37 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <SPI.h>
-#include <SD.h>
+#include <SD_MMC.h>
 #include <FS.h>
 #include <TFT_eSPI.h>
 #include <Adafruit_NeoPixel.h>
 #include <driver/i2s.h>
 #include <Audio.h>
+#include <WebSocketsClient.h>
 
 #include "config.h"   // Khóa API + endpoints
 
 // ========================= CẤU HÌNH CHÂN =========================
 // LCD ST7789 đã định nghĩa trong platformio.ini qua TFT_eSPI build flags
 
-// INMP441 I2S Microphone (RX)
-#define I2S_MIC_PORT        I2S_NUM_0
+// INMP441 I2S Microphone (RX) — dùng I2S port 1 (Audio lib cần port 0)
+#define I2S_MIC_PORT        I2S_NUM_1
 #define I2S_MIC_SCK         4
 #define I2S_MIC_WS          5
 #define I2S_MIC_SD          6
 
 // MAX98357 I2S Audio (TX) — dùng ESP32-audioI2S
-#define I2S_SPK_BCLK        15
-#define I2S_SPK_LRC         16
-#define I2S_SPK_DIN         7
+#define I2S_SPK_BCLK        8
+#define I2S_SPK_LRC         7
+#define I2S_SPK_DIN         9
 
-// MicroSD (SPI riêng)
-#define SD_CS               34
-#define SD_MOSI             35
-#define SD_MISO             37
-#define SD_SCLK             36
+// Onboard TF card (SDMMC, Waveshare ESP32-S3-LCD-1.47B)
+#define SD_CLK              14
+#define SD_CMD              15
+#define SD_D0               16
+#define SD_D1               18
+#define SD_D2               17
+#define SD_D3               21
 
 // RGB LED (NeoPixel onboard)
 #define RGB_LED_PIN         38
@@ -57,18 +60,20 @@
 // ========================= CẤU HÌNH AUDIO =========================
 #define SAMPLE_RATE         16000
 #define SAMPLE_BITS         16
-#define RECORD_SECONDS_MAX  10
+#define RECORD_SECONDS_MAX  15        // Giữ câu hỏi ngắn để STT/upload nhanh hơn
 #define RECORD_BUFFER_LEN   (SAMPLE_RATE * RECORD_SECONDS_MAX * (SAMPLE_BITS / 8))
 #define TTS_IDLE_TIMEOUT_MS 10000
 #define DMA_BUF_COUNT       8
 #define DMA_BUF_LEN         1024
-#define ALWAYS_LISTEN       1
+#define ALWAYS_LISTEN       0         // 0 = đứng yên, chỉ nghe khi bấm nút BOOT
 #define MIC_CHUNK_SAMPLES   512
 #define VOICE_START_LEVEL   900
-#define VOICE_STOP_LEVEL    450
+#define VOICE_STOP_LEVEL    700
 #define VOICE_START_CHUNKS  3
-#define VOICE_MIN_MS        900
-#define VOICE_SILENCE_MS    1000
+#define VOICE_MIN_MS        500       // Nói ít nhất 0.5s trước khi cho phép dừng
+#define VOICE_SILENCE_MS    600       // Im lặng 0.6s thì dừng record
+#define CONVO_TIMEOUT_MS    15000     // 15s không nói gì thì thoát conversation mode
+#define EDGE_TTS_VOLUME     "+60%"    // Edge TTS prosody gain. Giảm xuống +30% nếu bị rè.
 
 // Wake phrase mac dinh. Sua o day neu sau nay ban muon doi ten goi robot.
 #define WAKE_PHRASE         "hey jet"
@@ -93,7 +98,9 @@ struct LanguageCfg {
 //   Domi    : AZnzlk1XvdvUeBnXmlld
 static const LanguageCfg LANGS[LANG_COUNT] = {
     { "vi", "TIENG VIET",  "EXAVITQu4vr4xnSDxMaL",
-      "Bạn là trợ lý ảo thân thiện. Trả lời ngắn gọn bằng tiếng Việt.",
+      "Bạn là người bạn AI vui vẻ của trẻ em 6-12 tuổi. "
+      "Trả lời ngắn gọn, tự nhiên bằng tiếng Việt có dấu đầy đủ. "
+      "Tuyệt đối không viết tiếng Việt không dấu.",
       "Đã chuyển sang tiếng Việt.",
       TFT_GREEN },
     { "en", "ENGLISH",     "21m00Tcm4TlvDq8ikWAM",
@@ -125,18 +132,27 @@ enum AssistantState {
 // ========================= ĐỐI TƯỢNG TOÀN CỤC =========================
 TFT_eSPI            tft = TFT_eSPI();
 Adafruit_NeoPixel   rgb(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
-SPIClass            sdSPI(HSPI);
-Audio               audio;
+Audio*              audio = nullptr;  // Speaker khởi tạo trong setup để tránh treo trước Serial
 
 AssistantState      currentState  = STATE_BOOT;
 Language            currentLang   = LANG_VI;
 String              userName      = "Bạn";
 String              lastUserText;
 String              lastAssistantText;
+bool                inConversation = false;  // true = đang trong cuộc hội thoại liên tục
 
 uint8_t*            recordBuffer  = nullptr;
 int32_t*            micRawBuffer  = nullptr;
 size_t              recordedBytes = 0;
+bool                sdMounted     = false;
+
+// Persistent HTTPS clients — giữ TCP + TLS handshake xuyên giữa các lượt
+// để khỏi mỗi lần gọi API lại tốn 1.5–3 s bắt tay mới trên mbedTLS.
+WiFiClientSecure    gGroqClient;
+WiFiClientSecure    gDeepSeekClient;
+bool                gGroqClientInit     = false;
+bool                gDeepSeekClientInit = false;
+HTTPClient          gDeepSeekHttp;
 
 #define MAX_TTS_SEGMENTS 8
 String              ttsSegmentTexts[MAX_TTS_SEGMENTS];
@@ -147,6 +163,7 @@ uint8_t             ttsSegmentIndex = 0;
 // ========================= KHAI BÁO HÀM =========================
 void   setState(AssistantState s);
 void   updateDisplay(const String& title, const String& body, uint16_t color);
+void   drawRobotFace(AssistantState state, uint16_t color);
 void   setLED(uint8_t r, uint8_t g, uint8_t b);
 bool   initSDCard();
 void   loadProfile();
@@ -158,41 +175,171 @@ size_t readMicChunk(int16_t* out, size_t maxSamples, uint32_t* avgAbs);
 String sendToGroqWhisper();
 String askDeepSeek(const String& userMessage);
 String buildSegmentedSystemPrompt();
+Language langFromWhisperName(const String& name, const String& transcript, Language fallback);
+bool   looksLikeCantonese(const String& text);
+String normalizeForEcho(const String& text);
+bool   isEchoReply(const String& reply, const String& userMessage);
 Language langFromCode(const String& code, Language fallback);
 void   resetTtsSegments();
 void   prepareSingleTtsSegment(const String& text, Language lang);
 void   prepareTtsSegments(const String& answer, Language fallbackLang);
 String flattenTtsSegments();
 bool   startNextTtsSegment();
-bool   speakViaElevenLabs(const String& text, Language voiceLang);
+bool   speakViaEdgeTTS(const String& text, Language voiceLang);
+bool   speakViaElevenLabsSD(const String& text, Language voiceLang);
+bool   speakViaGoogleTtsDirect(const String& text, Language voiceLang);
+bool   isJunkTranscript(const String& text);
 int    detectLanguageSwitch(const String& text);
 bool   extractWakeCommand(String& text);
 String buildWavHeader(uint32_t pcmBytes);
 
+// ========================= VIETNAMESE ASCII HELPER =========================
+// Bỏ dấu tiếng Việt (UTF-8) → ASCII cho LCD fonts không hỗ trợ Unicode
+String stripVietnamese(const String& input) {
+    // Map 2-byte UTF-8 Vietnamese chars → ASCII
+    struct VietMap { const char* utf8; char ascii; };
+    static const VietMap map[] = {
+        // a
+        {"\xC3\xA0",'a'},{"\xC3\xA1",'a'},{"\xC3\xA3",'a'},{"\xE1\xBA\xA1",'a'},
+        {"\xC4\x83",'a'},{"\xE1\xBA\xAF",'a'},{"\xE1\xBA\xB1",'a'},{"\xE1\xBA\xB3",'a'},{"\xE1\xBA\xB5",'a'},{"\xE1\xBA\xB7",'a'},
+        {"\xC3\xA2",'a'},{"\xE1\xBA\xA5",'a'},{"\xE1\xBA\xA7",'a'},{"\xE1\xBA\xA9",'a'},{"\xE1\xBA\xAB",'a'},{"\xE1\xBA\xAD",'a'},
+        // e
+        {"\xC3\xA8",'e'},{"\xC3\xA9",'e'},{"\xE1\xBA\xBB",'e'},{"\xE1\xBA\xBD",'e'},{"\xE1\xBA\xB9",'e'},
+        {"\xC3\xAA",'e'},{"\xE1\xBB\x81",'e'},{"\xE1\xBA\xBF",'e'},{"\xE1\xBB\x83",'e'},{"\xE1\xBB\x85",'e'},{"\xE1\xBB\x87",'e'},
+        // i
+        {"\xC3\xAC",'i'},{"\xC3\xAD",'i'},{"\xE1\xBB\x89",'i'},{"\xC4\xA9",'i'},{"\xE1\xBB\x8B",'i'},
+        // o
+        {"\xC3\xB2",'o'},{"\xC3\xB3",'o'},{"\xE1\xBB\x8F",'o'},{"\xC3\xB5",'o'},{"\xE1\xBB\x8D",'o'},
+        {"\xC3\xB4",'o'},{"\xE1\xBB\x91",'o'},{"\xE1\xBB\x93",'o'},{"\xE1\xBB\x95",'o'},{"\xE1\xBB\x97",'o'},{"\xE1\xBB\x99",'o'},
+        {"\xC6\xA1",'o'},{"\xE1\xBB\x9B",'o'},{"\xE1\xBB\x9D",'o'},{"\xE1\xBB\x9F",'o'},{"\xE1\xBB\xA1",'o'},{"\xE1\xBB\xA3",'o'},
+        // u
+        {"\xC3\xB9",'u'},{"\xC3\xBA",'u'},{"\xE1\xBB\xA7",'u'},{"\xC5\xA9",'u'},{"\xE1\xBB\xA5",'u'},
+        {"\xC6\xB0",'u'},{"\xE1\xBB\xA9",'u'},{"\xE1\xBB\xAB",'u'},{"\xE1\xBB\xAD",'u'},{"\xE1\xBB\xAF",'u'},{"\xE1\xBB\xB1",'u'},
+        // y
+        {"\xE1\xBB\xB3",'y'},{"\xC3\xBD",'y'},{"\xE1\xBB\xB7",'y'},{"\xE1\xBB\xB9",'y'},{"\xE1\xBB\xB5",'y'},
+        // d
+        {"\xC4\x91",'d'},
+        // UPPER
+        {"\xC3\x80",'A'},{"\xC3\x81",'A'},{"\xC3\x83",'A'},{"\xC4\x82",'A'},{"\xC3\x82",'A'},
+        {"\xC3\x88",'E'},{"\xC3\x89",'E'},{"\xC3\x8A",'E'},
+        {"\xC3\x8C",'I'},{"\xC3\x8D",'I'},
+        {"\xC3\x92",'O'},{"\xC3\x93",'O'},{"\xC3\x95",'O'},{"\xC3\x94",'O'},{"\xC6\xA0",'O'},
+        {"\xC3\x99",'U'},{"\xC3\x9A",'U'},{"\xC6\xAF",'U'},
+        {"\xC3\x9D",'Y'},
+        {"\xC4\x90",'D'},
+    };
+    String out;
+    out.reserve(input.length());
+    const char* p = input.c_str();
+    while (*p) {
+        bool found = false;
+        for (const auto& m : map) {
+            size_t len = strlen(m.utf8);
+            if (strncmp(p, m.utf8, len) == 0) {
+                out += m.ascii;
+                p += len;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if ((uint8_t)*p >= 0x80) {
+                // Skip unknown multi-byte UTF-8 char
+                if ((*p & 0xE0) == 0xC0) p += 2;
+                else if ((*p & 0xF0) == 0xE0) p += 3;
+                else if ((*p & 0xF8) == 0xF0) p += 4;
+                else p++;
+                out += '?';
+            } else {
+                out += *p++;
+            }
+        }
+    }
+    return out;
+}
+
 // ========================= LCD HELPER =========================
+void drawRobotFace(AssistantState state, uint16_t color) {
+    int cx = 58;
+    int cy = tft.height() / 2 + 6;
+    int r  = min(46, max(30, tft.height() / 3));
+
+    uint16_t faceFill = TFT_DARKGREY;
+    tft.fillCircle(cx, cy, r, faceFill);
+    tft.drawCircle(cx, cy, r, color);
+    tft.drawCircle(cx, cy, r - 1, color);
+
+    int eyeY = cy - 12;
+    int leftX = cx - 16;
+    int rightX = cx + 16;
+    uint16_t eyeColor = TFT_WHITE;
+
+    if (state == STATE_THINKING) {
+        tft.fillCircle(leftX, eyeY, 5, eyeColor);
+        tft.fillCircle(rightX, eyeY, 5, eyeColor);
+        tft.fillCircle(leftX + 2, eyeY + 1, 2, TFT_BLACK);
+        tft.fillCircle(rightX + 2, eyeY + 1, 2, TFT_BLACK);
+        tft.drawString("...", cx - 12, cy + 8);
+    } else if (state == STATE_LISTENING || state == STATE_TRANSCRIBING) {
+        tft.fillCircle(leftX, eyeY, 6, eyeColor);
+        tft.fillCircle(rightX, eyeY, 6, eyeColor);
+        tft.fillCircle(leftX, eyeY, 2, TFT_BLACK);
+        tft.fillCircle(rightX, eyeY, 2, TFT_BLACK);
+        tft.drawCircle(cx, cy + 15, 8, eyeColor);
+    } else if (state == STATE_SPEAKING) {
+        tft.fillRoundRect(leftX - 7, eyeY - 4, 14, 8, 3, eyeColor);
+        tft.fillRoundRect(rightX - 7, eyeY - 4, 14, 8, 3, eyeColor);
+        tft.fillRoundRect(cx - 18, cy + 10, 36, 10, 4, eyeColor);
+        tft.drawFastVLine(cx - 6, cy + 10, 10, TFT_BLACK);
+        tft.drawFastVLine(cx + 6, cy + 10, 10, TFT_BLACK);
+    } else if (state == STATE_ERROR) {
+        tft.drawLine(leftX - 5, eyeY - 5, leftX + 5, eyeY + 5, TFT_RED);
+        tft.drawLine(leftX + 5, eyeY - 5, leftX - 5, eyeY + 5, TFT_RED);
+        tft.drawLine(rightX - 5, eyeY - 5, rightX + 5, eyeY + 5, TFT_RED);
+        tft.drawLine(rightX + 5, eyeY - 5, rightX - 5, eyeY + 5, TFT_RED);
+        tft.drawLine(cx - 14, cy + 18, cx + 14, cy + 18, TFT_RED);
+    } else {
+        tft.fillCircle(leftX, eyeY, 5, eyeColor);
+        tft.fillCircle(rightX, eyeY, 5, eyeColor);
+        tft.drawLine(cx - 18, cy + 12, cx - 8, cy + 20, eyeColor);
+        tft.drawLine(cx - 8, cy + 20, cx + 8, cy + 20, eyeColor);
+        tft.drawLine(cx + 8, cy + 20, cx + 18, cy + 12, eyeColor);
+    }
+}
+
 void updateDisplay(const String& title, const String& body, uint16_t color) {
+    String safeTitle = stripVietnamese(title);
+    String safeBody  = stripVietnamese(body);
+
     tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(color, TFT_BLACK);
-    tft.setTextDatum(TC_DATUM);
+    drawRobotFace(currentState, color);
+
+    int panelX = 116;
+    int panelW = tft.width() - panelX - 8;
+    int y = 12;
+
+    tft.setTextDatum(TL_DATUM);
     tft.setTextSize(2);
-    tft.drawString(title, tft.width() / 2, 8);
+    tft.setTextColor(color, TFT_BLACK);
+    tft.drawString(safeTitle, panelX, y);
 
     // Thanh ngôn ngữ hiện hành
     tft.setTextSize(1);
     tft.setTextColor(LANGS[currentLang].accentColor, TFT_BLACK);
-    tft.drawString(LANGS[currentLang].displayName, tft.width() / 2, 32);
+    String safeLangName = stripVietnamese(LANGS[currentLang].displayName);
+    tft.drawString(safeLangName, panelX, y + 24);
 
-    tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
 
-    int x = 4, y = 56;
+    int x = panelX;
+    y = 52;
     int lineH = 12;
-    int maxChars = (tft.width() - 8) / 6;
+    int maxChars = max(8, panelW / 6);
     String word, line;
 
-    for (size_t i = 0; i <= body.length(); i++) {
-        char c = i < body.length() ? body[i] : ' ';
-        if (c == ' ' || c == '\n' || i == body.length()) {
+    for (size_t i = 0; i <= safeBody.length(); i++) {
+        char c = i < safeBody.length() ? safeBody[i] : ' ';
+        if (c == ' ' || c == '\n' || i == safeBody.length()) {
             if ((line.length() + word.length() + 1) > (size_t)maxChars || c == '\n') {
                 tft.drawString(line, x, y);
                 y += lineH;
@@ -232,7 +379,7 @@ void setState(AssistantState s) {
         case STATE_IDLE:
             setLED(0, 60, 0);
             updateDisplay("READY",
-                String("Chao ") + userName + "!\nNoi: Hey Jet...",
+                String("Chao ") + userName + "!\nNoi de hoi...",
                 TFT_GREEN);
             break;
         case STATE_LISTENING:
@@ -262,21 +409,30 @@ void setState(AssistantState s) {
 
 // ========================= MICROSD =========================
 bool initSDCard() {
-    sdSPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, sdSPI, 20000000)) {
-        Serial.println("[SD] Mount fail");
+    Serial.println("[SD] SD_MMC.setPins..."); Serial.flush();
+    if (!SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3)) {
+        Serial.println("[SD] setPins fail");
+        sdMounted = false;
         return false;
     }
-    Serial.printf("[SD] OK, %llu MB\n", SD.cardSize() / (1024ULL * 1024ULL));
+    Serial.println("[SD] SD_MMC.begin..."); Serial.flush();
+    delay(10);
+    if (!SD_MMC.begin("/sdcard", false, false, 20000, 5)) {
+        Serial.println("[SD] Mount fail");
+        sdMounted = false;
+        return false;
+    }
+    sdMounted = true;
+    Serial.printf("[SD] OK, %llu MB\n", SD_MMC.cardSize() / (1024ULL * 1024ULL));
     return true;
 }
 
 void loadProfile() {
-    if (!SD.exists("/profile.json")) {
+    if (!SD_MMC.exists("/profile.json")) {
         Serial.println("[Profile] Khong co, dung mac dinh");
         return;
     }
-    File f = SD.open("/profile.json", FILE_READ);
+    File f = SD_MMC.open("/profile.json", FILE_READ);
     if (!f) return;
     JsonDocument doc;
     DeserializationError err = deserializeJson(doc, f);
@@ -297,7 +453,8 @@ void loadProfile() {
 }
 
 void saveConversation(const String& user, const String& bot) {
-    File f = SD.open("/history.log", FILE_APPEND);
+    if (!sdMounted) return;
+    File f = SD_MMC.open("/history.log", FILE_APPEND);
     if (!f) return;
     f.printf("[%lu][%s] U: %s\n[%lu][%s] A: %s\n",
              millis(), LANGS[currentLang].whisperCode, user.c_str(),
@@ -448,18 +605,23 @@ String buildWavHeader(uint32_t pcmBytes) {
 String sendToGroqWhisper() {
     if (recordedBytes == 0) return "";
 
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(30000);
-
-    if (!client.connect("api.groq.com", 443)) {
-        Serial.println("[GROQ] Connect fail");
-        return "";
+    if (!gGroqClientInit) {
+        gGroqClient.setInsecure();
+        gGroqClient.setTimeout(30000);
+        gGroqClientInit = true;
     }
 
-    const char* langCode = LANGS[currentLang].whisperCode;
-    // Whisper không hỗ trợ "yue" trực tiếp → dùng "zh" cho Quảng Đông
-    if (strcmp(langCode, "yue") == 0) langCode = "zh";
+    bool reused = gGroqClient.connected();
+    if (!reused) {
+        unsigned long ths = millis();
+        if (!gGroqClient.connect("api.groq.com", 443)) {
+            Serial.println("[GROQ] Connect fail");
+            return "";
+        }
+        Serial.printf("[GROQ] TLS handshake %lu ms\n", millis() - ths);
+    } else {
+        Serial.println("[GROQ] Reuse connection");
+    }
 
     String boundary = "----ESP32Boundary7MA4YWxkTrZu0gW";
     String head =
@@ -467,11 +629,12 @@ String sendToGroqWhisper() {
         "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
         "whisper-large-v3\r\n"
         "--" + boundary + "\r\n"
-        "Content-Disposition: form-data; name=\"language\"\r\n\r\n" +
-        String(langCode) + "\r\n"
-        "--" + boundary + "\r\n"
         "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n"
-        "json\r\n"
+        "verbose_json\r\n"
+        "--" + boundary + "\r\n"
+        "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n"
+        "The audio may be Vietnamese, English, Mandarin Chinese, or Cantonese. "
+        "Transcribe exactly what the speaker says.\r\n"
         "--" + boundary + "\r\n"
         "Content-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\n"
         "Content-Type: audio/wav\r\n\r\n";
@@ -480,30 +643,85 @@ String sendToGroqWhisper() {
 
     size_t contentLength = head.length() + wavHeader.length() + recordedBytes + tail.length();
 
-    client.printf("POST /openai/v1/audio/transcriptions HTTP/1.1\r\n");
-    client.printf("Host: api.groq.com\r\n");
-    client.printf("Authorization: Bearer %s\r\n", GROQ_API_KEY);
-    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
-    client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
-    client.printf("Connection: close\r\n\r\n");
+    gGroqClient.printf("POST /openai/v1/audio/transcriptions HTTP/1.1\r\n");
+    gGroqClient.printf("Host: api.groq.com\r\n");
+    gGroqClient.printf("Authorization: Bearer %s\r\n", GROQ_API_KEY);
+    gGroqClient.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
+    gGroqClient.printf("Content-Length: %u\r\n", (unsigned)contentLength);
+    // KHÔNG gửi "Connection: close" → server giữ TCP/TLS sống, lượt sau khỏi handshake.
+    gGroqClient.printf("\r\n");
 
-    client.print(head);
-    client.print(wavHeader);
-    const size_t CHUNK = 2048;
+    gGroqClient.print(head);
+    gGroqClient.print(wavHeader);
+    const size_t CHUNK = 4096;
     for (size_t i = 0; i < recordedBytes; i += CHUNK) {
         size_t n = min(CHUNK, recordedBytes - i);
-        client.write(recordBuffer + i, n);
+        gGroqClient.write(recordBuffer + i, n);
     }
-    client.print(tail);
+    gGroqClient.print(tail);
 
-    String line;
-    while (client.connected()) {
-        line = client.readStringUntil('\n');
-        if (line == "\r" || line.length() == 0) break;
+    // Parse headers — tìm Content-Length để biết đọc đến đâu thì dừng (giữ
+    // connection clean cho lượt sau). Nếu server đột nhiên đóng (server timeout
+    // giữa các lượt) thì gọi connect() lại ở lần sau.
+    int  contentLen = -1;
+    bool keepAlive  = true;   // HTTP/1.1 mặc định keep-alive
+    unsigned long tHdr = millis();
+    while (gGroqClient.connected() && millis() - tHdr < 15000) {
+        String line = gGroqClient.readStringUntil('\n');
+        if (line.length() == 0 || line == "\r") break;
+        String low = line;
+        low.toLowerCase();
+        if (low.startsWith("content-length:")) {
+            String num = line.substring(15);
+            num.trim();
+            contentLen = num.toInt();
+        } else if (low.startsWith("connection:")) {
+            String v = low.substring(11);
+            v.trim();
+            if (v == "close") keepAlive = false;
+        } else if (low.startsWith("transfer-encoding:") &&
+                   low.indexOf("chunked") >= 0) {
+            contentLen = -1;    // chunked → fallback read-until-close
+            keepAlive  = false;
+        }
     }
+
     String body;
-    while (client.available()) body += (char)client.read();
-    client.stop();
+    if (contentLen > 0) {
+        body.reserve(contentLen + 1);
+        unsigned long lastData = millis();
+        while ((int)body.length() < contentLen) {
+            int avail = gGroqClient.available();
+            if (avail > 0) {
+                int toRead = min(avail, contentLen - (int)body.length());
+                for (int k = 0; k < toRead; k++) body += (char)gGroqClient.read();
+                lastData = millis();
+            } else if (millis() - lastData > 5000) {
+                Serial.println("[GROQ] Body read timeout");
+                gGroqClient.stop();
+                keepAlive = false;
+                break;
+            } else {
+                delay(1);
+            }
+        }
+    } else {
+        // Không biết độ dài → đọc tới khi socket đóng, không thể reuse.
+        unsigned long lastData = millis();
+        while ((gGroqClient.connected() || gGroqClient.available()) &&
+               millis() - lastData < 8000) {
+            if (gGroqClient.available()) {
+                body += (char)gGroqClient.read();
+                lastData = millis();
+            } else {
+                delay(1);
+            }
+        }
+        gGroqClient.stop();
+        keepAlive = false;
+    }
+
+    if (!keepAlive) gGroqClient.stop();
 
     int braceStart = body.indexOf('{');
     if (braceStart < 0) return "";
@@ -514,7 +732,22 @@ String sendToGroqWhisper() {
     JsonDocument doc;
     if (deserializeJson(doc, body)) return "";
     if (!doc["text"].is<const char*>()) return "";
-    return doc["text"].as<String>();
+    String text = doc["text"].as<String>();
+    text.trim();
+
+    String detectedName = doc["language"].is<const char*>() ? doc["language"].as<String>() : "";
+    Language detectedLang = langFromWhisperName(detectedName, text, currentLang);
+    if (detectedLang != currentLang) {
+        currentLang = detectedLang;
+        Serial.printf("[LANG] Auto detect -> %s (%s)\n",
+                      LANGS[currentLang].displayName,
+                      detectedName.c_str());
+    } else if (detectedName.length()) {
+        Serial.printf("[LANG] Auto detect kept -> %s (%s)\n",
+                      LANGS[currentLang].displayName,
+                      detectedName.c_str());
+    }
+    return text;
 }
 
 // ========================= SEGMENTED CHAT / TTS =========================
@@ -523,16 +756,71 @@ String buildSegmentedSystemPrompt() {
         "\n\nIMPORTANT OUTPUT FORMAT:\n"
         "Return ONLY one JSON object. No markdown, no extra text.\n"
         "The object must be {\"segments\":[{\"lang\":\"vi|en|zh|yue\",\"text\":\"...\"}]}.\n"
+        "Never repeat the user's sentence as the whole answer. Answer the question or ask a short clarification.\n"
+        "For every segment with lang=vi, write natural Vietnamese with full diacritics. "
+        "Never write unaccented Vietnamese like 'Toi muon uong nuoc'.\n"
         "Use the user's language for explanations, but put every pronunciation sample "
         "in its own item with the real language of that sample.\n"
         "Examples:\n"
-        "{\"segments\":[{\"lang\":\"vi\",\"text\":\"Cau tieng Anh la:\"},"
+        "{\"segments\":[{\"lang\":\"vi\",\"text\":\"Câu tiếng Anh là:\"},"
         "{\"lang\":\"en\",\"text\":\"I want to drink water.\"},"
-        "{\"lang\":\"vi\",\"text\":\"Nghia la: Toi muon uong nuoc.\"}]}\n"
+        "{\"lang\":\"vi\",\"text\":\"Nghĩa là: Tôi muốn uống nước.\"}]}\n"
         "If the user asks in Vietnamese for English or Chinese, explain in Vietnamese "
         "and tag English samples as en, Mandarin samples as zh, Cantonese samples as yue.\n"
         "If the user asks in Cantonese for English or Mandarin, explain in Cantonese "
         "and tag English samples as en, Mandarin samples as zh.\n";
+}
+
+bool looksLikeCantonese(const String& text) {
+    const char* markers[] = {
+        "嘅", "咁", "嚟", "喺", "唔", "啲", "咗", "佢", "嗰", "冇",
+        "咩", "嘢", "點解", "啦", "㗎", "喎", "噃", "畀"
+    };
+    for (const char* marker : markers) {
+        if (text.indexOf(marker) >= 0) return true;
+    }
+    return false;
+}
+
+Language langFromWhisperName(const String& name, const String& transcript, Language fallback) {
+    String n = name;
+    n.toLowerCase();
+    n.trim();
+    if (n == "vi" || n == "vietnamese") return LANG_VI;
+    if (n == "en" || n == "english") return LANG_EN;
+    if (n == "zh" || n == "chinese" || n == "mandarin") {
+        return looksLikeCantonese(transcript) ? LANG_YUE : LANG_ZH;
+    }
+    if (n == "yue" || n == "cantonese") return LANG_YUE;
+    return fallback;
+}
+
+String normalizeForEcho(const String& text) {
+    String out;
+    out.reserve(text.length());
+    String t = text;
+    t.trim();
+    t.toLowerCase();
+    for (size_t i = 0; i < t.length(); i++) {
+        char c = t[i];
+        if (c == '.' || c == ',' || c == '?' || c == '!' ||
+            c == ':' || c == ';' || c == '"' || c == '\'' ||
+            c == '-' || c == '(' || c == ')' || c == '[' || c == ']') {
+            continue;
+        }
+        out += c;
+    }
+    out.trim();
+    return out;
+}
+
+bool isEchoReply(const String& reply, const String& userMessage) {
+    String a = normalizeForEcho(reply);
+    String b = normalizeForEcho(userMessage);
+    if (a.isEmpty() || b.isEmpty()) return false;
+    if (a == b) return true;
+    return ((a.length() <= b.length() + 8 && b.indexOf(a) >= 0) ||
+            (b.length() <= a.length() + 8 && a.indexOf(b) >= 0));
 }
 
 Language langFromCode(const String& code, Language fallback) {
@@ -637,27 +925,21 @@ bool startNextTtsSegment() {
                       (unsigned)ttsSegmentIndex,
                       (unsigned)ttsSegmentCount,
                       LANGS[lang].whisperCode);
-        if (speakViaElevenLabs(text, lang)) return true;
+        // Edge TTS: giọng tự nhiên, miễn phí (cần SD)
+        if (sdMounted && speakViaEdgeTTS(text, lang)) return true;
+        // Fallback: Google TTS (không cần SD, giọng robot hơn)
+        if (speakViaGoogleTtsDirect(text, lang)) return true;
     }
     return false;
 }
 
 // ========================= DEEPSEEK =========================
 String askDeepSeek(const String& userMessage) {
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(45000);
-    HTTPClient https;
-
-    if (!https.begin(client, DEEPSEEK_URL)) return "";
-    https.addHeader("Content-Type", "application/json");
-    https.addHeader("Authorization", String("Bearer ") + DEEPSEEK_API_KEY);
-    https.setTimeout(45000);
-
     JsonDocument req;
     req["model"]       = "deepseek-chat";
-    req["temperature"] = 0.7;
-    req["max_tokens"]  = 700;
+    req["temperature"] = 0.4;
+    req["max_tokens"]  = 120;
+    req["stream"]      = false;
     JsonObject responseFormat = req["response_format"].to<JsonObject>();
     responseFormat["type"] = "json_object";
     JsonArray msgs = req["messages"].to<JsonArray>();
@@ -670,67 +952,263 @@ String askDeepSeek(const String& userMessage) {
 
     String payload;
     serializeJson(req, payload);
+    Serial.printf("[DeepSeek] POST %u bytes\n", (unsigned)payload.length());
 
-    int code = https.POST(payload);
-    String reply;
-    if (code == HTTP_CODE_OK) {
-        String resp = https.getString();
-        JsonDocument doc;
-        if (!deserializeJson(doc, resp)) {
-            reply = doc["choices"][0]["message"]["content"].as<String>();
-        }
-    } else {
-        Serial.printf("[DeepSeek] HTTP %d\n", code);
+    if (!gDeepSeekClientInit) {
+        gDeepSeekClient.setInsecure();
+        gDeepSeekClient.setTimeout(60000);
+        gDeepSeekHttp.setReuse(true);  // giữ TCP/TLS sống giữa các lượt
+        gDeepSeekClientInit = true;
     }
-    https.end();
+
+    String reply;
+    for (uint8_t attempt = 1; attempt <= 2 && reply.isEmpty(); attempt++) {
+        bool reused = gDeepSeekClient.connected();
+        unsigned long ths = millis();
+
+        if (!gDeepSeekHttp.begin(gDeepSeekClient, DEEPSEEK_URL)) {
+            Serial.println("[DeepSeek] begin fail");
+            return "";
+        }
+        gDeepSeekHttp.useHTTP10(true);  // tránh lỗi body rỗng với chunked response
+        gDeepSeekHttp.addHeader("Content-Type", "application/json");
+        gDeepSeekHttp.addHeader("Accept", "application/json");
+        gDeepSeekHttp.addHeader("Accept-Encoding", "identity");
+        gDeepSeekHttp.addHeader("Authorization", String("Bearer ") + DEEPSEEK_API_KEY);
+        gDeepSeekHttp.setTimeout(60000);
+
+        int code = gDeepSeekHttp.POST(payload);
+        unsigned long dt = millis() - ths;
+        Serial.printf("[DeepSeek] attempt=%u HTTP %d (%lu ms, %s)\n",
+                      attempt, code, dt, reused ? "reuse" : "new TLS");
+        String resp = gDeepSeekHttp.getString();
+        Serial.printf("[DeepSeek] body len=%u\n", (unsigned)resp.length());
+        if (resp.length()) Serial.printf("[DeepSeek] body: %.220s\n", resp.c_str());
+
+        if (code == HTTP_CODE_OK && resp.length()) {
+            JsonDocument doc;
+            DeserializationError err = deserializeJson(doc, resp);
+            if (!err) {
+                reply = doc["choices"][0]["message"]["content"].as<String>();
+                reply.trim();
+            } else {
+                Serial.printf("[DeepSeek] JSON err: %s\n", err.c_str());
+            }
+        } else {
+            Serial.printf("[DeepSeek] err: %s\n", gDeepSeekHttp.errorToString(code).c_str());
+        }
+        gDeepSeekHttp.end();  // với setReuse(true) → KHÔNG đóng underlying client
+
+        if (reply.isEmpty() && attempt < 2) {
+            Serial.println("[DeepSeek] empty/invalid reply, retry...");
+            // Fail có thể do server đã đóng kết nối → ép drop để lần 2 handshake lại.
+            gDeepSeekClient.stop();
+            delay(350);
+        }
+    }
     return reply;
 }
 
-// ========================= ELEVENLABS TTS =========================
-// POST /v1/text-to-speech/{voice_id} → trả MP3 binary
-bool speakViaElevenLabs(const String& text, Language voiceLang) {
-    if (!SD.begin(SD_CS, sdSPI, 20000000)) {
-        Serial.println("[TTS] SD chua san sang");
+// ========================= EDGE TTS (Microsoft) =========================
+// Giọng tự nhiên, miễn phí, qua WebSocket đến speech.platform.bing.com
+// Lưu MP3 vào SD rồi phát qua ESP32-audioI2S.
+
+static File    edgeTtsFile;
+static bool    edgeTtsDone;
+static bool    edgeTtsConnected;
+static int     edgeTtsBytes;
+
+static const char* EDGE_VOICES[] = {
+    "vi-VN-NamMinhNeural",     // LANG_VI - same as tests/test.py / py/common.py
+    "en-US-AriaNeural",        // LANG_EN - same as tests/test.py / py/common.py
+    "zh-CN-XiaoxiaoNeural",    // LANG_ZH
+    "zh-HK-HiuMaanNeural",     // LANG_YUE - same as tests/test.py / py/common.py
+};
+
+void edgeTtsEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case WStype_CONNECTED:
+            Serial.println("[EDGE] WS connected");
+            edgeTtsConnected = true;
+            break;
+        case WStype_DISCONNECTED:
+            Serial.println("[EDGE] WS disconnected");
+            edgeTtsDone = true;
+            break;
+        case WStype_TEXT: {
+            String msg((char*)payload, length);
+            if (msg.indexOf("turn.end") >= 0) {
+                Serial.println("[EDGE] turn.end");
+                edgeTtsDone = true;
+            }
+            break;
+        }
+        case WStype_BIN: {
+            if (length < 2) break;
+            uint16_t hdrLen = ((uint16_t)payload[0] << 8) | payload[1];
+            size_t audioStart = 2 + hdrLen;
+            if (audioStart >= length) break;
+            size_t audioLen = length - audioStart;
+            if (edgeTtsFile && audioLen > 0) {
+                edgeTtsFile.write(payload + audioStart, audioLen);
+                edgeTtsBytes += audioLen;
+            }
+            break;
+        }
+        default: break;
     }
+}
+
+bool speakViaEdgeTTS(const String& text, Language voiceLang) {
+    if (!audio || !sdMounted) return false;
+
+    String clean = text;
+    clean.trim();
+    if (clean.isEmpty()) return false;
+
+    // XML escape
+    clean.replace("&", "&amp;");
+    clean.replace("<", "&lt;");
+    clean.replace(">", "&gt;");
+    clean.replace("\"", "&quot;");
+
+    const char* voice = EDGE_VOICES[voiceLang < LANG_COUNT ? voiceLang : 0];
+    Serial.printf("[EDGE] voice=%s len=%u\n", voice, (unsigned)clean.length());
+
+    // Mở file trên SD
+    if (SD_MMC.exists("/tts.mp3")) SD_MMC.remove("/tts.mp3");
+    edgeTtsFile = SD_MMC.open("/tts.mp3", FILE_WRITE);
+    if (!edgeTtsFile) {
+        Serial.println("[EDGE] SD open fail");
+        return false;
+    }
+
+    edgeTtsDone = false;
+    edgeTtsConnected = false;
+    edgeTtsBytes = 0;
+
+    WebSocketsClient ws;
+    ws.onEvent(edgeTtsEvent);
+    ws.setExtraHeaders("Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold");
+    ws.beginSSL("speech.platform.bing.com", 443,
+        "/consumer/speech/synthesize/readaloud/token/6A5AA1D4EAFF4E9FB37E23D68491D6F4");
+
+    // Chờ kết nối (max 10s)
+    unsigned long t0 = millis();
+    while (!edgeTtsConnected && !edgeTtsDone && millis() - t0 < 10000) {
+        ws.loop();
+        delay(10);
+    }
+    if (!edgeTtsConnected) {
+        Serial.println("[EDGE] Connect timeout");
+        edgeTtsFile.close();
+        SD_MMC.remove("/tts.mp3");
+        return false;
+    }
+
+    // Gửi config (output format)
+    ws.sendTXT(
+        "Content-Type:application/json; charset=utf-8\r\n"
+        "Path:speech.config\r\n\r\n"
+        "{\"context\":{\"synthesis\":{\"audio\":{"
+        "\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\","
+        "\"wordBoundaryEnabled\":\"false\"},"
+        "\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}"
+    );
+    delay(50);
+    ws.loop();
+
+    // Tạo request ID (32 hex chars)
+    String reqId;
+    for (int i = 0; i < 32; i++) reqId += String(random(16), HEX);
+
+    // Gửi SSML
+    String ssml = String("X-RequestId:") + reqId +
+        "\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n"
+        "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>";
+    ssml += "<voice name='";
+    ssml += voice;
+    ssml += "'><prosody pitch='+0Hz' rate='+0%' volume='";
+    ssml += EDGE_TTS_VOLUME;
+    ssml += "'>";
+    ssml += clean;
+    ssml += "</prosody></voice></speak>";
+    ws.sendTXT(ssml);
+
+    // Chờ nhận audio (max 30s)
+    t0 = millis();
+    while (!edgeTtsDone && millis() - t0 < 30000) {
+        ws.loop();
+        delay(1);
+    }
+
+    edgeTtsFile.close();
+    ws.disconnect();
+
+    Serial.printf("[EDGE] Saved %d bytes to /tts.mp3\n", edgeTtsBytes);
+    if (edgeTtsBytes < 100) {
+        SD_MMC.remove("/tts.mp3");
+        return false;
+    }
+
+    bool ok = audio->connecttoFS(SD_MMC, "/tts.mp3");
+    Serial.printf("[EDGE] connecttoFS: %d\n", ok);
+    return ok;
+}
+
+// ========================= ELEVENLABS TTS VIA SD =========================
+// Có microSD: tải MP3 từ ElevenLabs, lưu /tts.mp3 rồi phát qua ESP32-audioI2S.
+bool speakViaElevenLabsSD(const String& text, Language voiceLang) {
+    if (!audio || !sdMounted) return false;
+
+    String clean = text;
+    clean.trim();
+    if (clean.isEmpty()) return false;
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(45000);
+    client.setTimeout(60000);
     HTTPClient https;
 
     String url = String("https://") + ELEVENLABS_HOST +
                  "/v1/text-to-speech/" + LANGS[voiceLang].voiceId;
 
-    if (!https.begin(client, url)) return false;
+    if (!https.begin(client, url)) {
+        Serial.println("[TTS] ElevenLabs begin fail");
+        return false;
+    }
     https.addHeader("xi-api-key", ELEVENLABS_API_KEY);
     https.addHeader("Content-Type", "application/json");
     https.addHeader("Accept", "audio/mpeg");
-    https.setTimeout(45000);
+    https.setTimeout(60000);
 
     JsonDocument req;
-    req["text"]       = text;
-    req["model_id"]   = ELEVENLABS_MODEL;
+    req["text"]     = clean;
+    req["model_id"] = ELEVENLABS_MODEL;
     JsonObject vs = req["voice_settings"].to<JsonObject>();
-    vs["stability"]        = 0.5;
-    vs["similarity_boost"] = 0.75;
-    vs["style"]            = 0.0;
-    vs["use_speaker_boost"]= true;
+    vs["stability"]         = 0.5;
+    vs["similarity_boost"]  = 0.75;
+    vs["style"]             = 0.0;
+    vs["use_speaker_boost"] = true;
 
     String payload;
     serializeJson(req, payload);
+    Serial.printf("[TTS] ElevenLabs POST len=%u\n", (unsigned)clean.length());
 
     int code = https.POST(payload);
     if (code != HTTP_CODE_OK) {
-        Serial.printf("[TTS] HTTP %d: %s\n", code, https.errorToString(code).c_str());
+        Serial.printf("[TTS] ElevenLabs HTTP %d: %s\n",
+                      code, https.errorToString(code).c_str());
+        String body = https.getString();
+        if (body.length()) Serial.printf("[TTS] body: %.160s\n", body.c_str());
         https.end();
         return false;
     }
 
-    // Lưu MP3 ra SD rồi phát qua ESP32-audioI2S
-    if (SD.exists("/tts.mp3")) SD.remove("/tts.mp3");
-    File mp3 = SD.open("/tts.mp3", FILE_WRITE);
+    if (SD_MMC.exists("/tts.mp3")) SD_MMC.remove("/tts.mp3");
+    File mp3 = SD_MMC.open("/tts.mp3", FILE_WRITE);
     if (!mp3) {
-        Serial.println("[TTS] Mo file fail");
+        Serial.println("[TTS] SD open /tts.mp3 fail");
         https.end();
         return false;
     }
@@ -757,11 +1235,88 @@ bool speakViaElevenLabs(const String& text, Language voiceLang) {
     }
     mp3.close();
     https.end();
-    Serial.printf("[TTS] Saved %d bytes\n", written);
+
+    Serial.printf("[TTS] ElevenLabs saved %d bytes\n", written);
     if (written < 100) return false;
 
-    audio.connecttoFS(SD, "/tts.mp3");
-    return true;
+    bool ok = audio->connecttoFS(SD_MMC, "/tts.mp3");
+    Serial.printf("[TTS] connecttoFS returned: %d, isRunning: %d\n", ok, audio->isRunning());
+    return ok;
+}
+
+// ========================= GOOGLE TTS DIRECT =========================
+// Google Translate TTS: miễn phí, giới hạn ~200 ký tự/request.
+// Nếu text dài hơn, tách thành câu nhỏ rồi phát từng câu blocking.
+bool speakViaGoogleTtsDirect(const String& text, Language voiceLang) {
+    String clean = text;
+    clean.trim();
+    if (clean.isEmpty()) return false;
+
+    const char* langCode = "vi";
+    switch (voiceLang) {
+        case LANG_VI:  langCode = "vi";    break;
+        case LANG_EN:  langCode = "en";    break;
+        case LANG_ZH:  langCode = "zh-CN"; break;
+        case LANG_YUE: langCode = "yue";   break;
+        default:       langCode = "vi";    break;
+    }
+
+    if (!audio) return false;
+
+    // Nếu text ngắn, phát trực tiếp (non-blocking, loop() sẽ xử lý)
+    if (clean.length() <= 180) {
+        Serial.printf("[TTS] Google lang=%s len=%u\n", langCode, (unsigned)clean.length());
+        bool ok = audio->connecttospeech(clean.c_str(), langCode);
+        Serial.printf("[TTS] connecttospeech: %d\n", ok);
+        return ok;
+    }
+
+    // Text dài: tách theo dấu câu, phát blocking từng phần
+    Serial.printf("[TTS] Google LONG text lang=%s len=%u, splitting...\n",
+                  langCode, (unsigned)clean.length());
+    int start = 0;
+    bool anyOk = false;
+    while (start < (int)clean.length()) {
+        // Tìm điểm cắt tốt nhất trong 180 ký tự
+        int end = start + 180;
+        if (end >= (int)clean.length()) {
+            end = clean.length();
+        } else {
+            // Tìm dấu câu gần nhất để cắt
+            int bestCut = -1;
+            const char* delims = ".!?,;:\n";
+            for (int i = end; i > start + 20; i--) {
+                if (strchr(delims, clean[i])) {
+                    bestCut = i + 1;
+                    break;
+                }
+            }
+            // Nếu không tìm thấy dấu câu, tìm khoảng trắng
+            if (bestCut < 0) {
+                for (int i = end; i > start + 20; i--) {
+                    if (clean[i] == ' ') { bestCut = i + 1; break; }
+                }
+            }
+            if (bestCut > start) end = bestCut;
+        }
+
+        String chunk = clean.substring(start, end);
+        chunk.trim();
+        start = end;
+        if (chunk.isEmpty()) continue;
+
+        Serial.printf("[TTS] Chunk len=%u: %.40s...\n", (unsigned)chunk.length(), chunk.c_str());
+        bool ok = audio->connecttospeech(chunk.c_str(), langCode);
+        if (ok) {
+            anyOk = true;
+            // Chờ phát xong chunk này trước khi phát chunk tiếp
+            unsigned long t0 = millis();
+            while (audio->isRunning() && millis() - t0 < 15000) {
+                audio->loop();
+            }
+        }
+    }
+    return anyOk;
 }
 
 // ========================= WAKE PHRASE =========================
@@ -773,6 +1328,27 @@ bool extractWakeCommand(String& text) {
 
     int pos = lower.indexOf(WAKE_PHRASE);
     int endPos = pos >= 0 ? pos + strlen(WAKE_PHRASE) : -1;
+
+    if (pos < 0) {
+        const char* variants[] = {
+            "hay jet", "hey jet", "hay j", "hey j",
+            "hay chet", "hey chet", "hey jack", "hay ch", "hey ch",
+            "e jet", "eh jet"
+        };
+        for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+            int vpos = lower.indexOf(variants[i]);
+            if (vpos < 0) continue;
+
+            pos = vpos;
+            endPos = vpos + strlen(variants[i]);
+            if (strcmp(variants[i], "hay ch") == 0 || strcmp(variants[i], "hey ch") == 0) {
+                int firstSpace = lower.indexOf(' ', vpos);
+                int secondSpace = firstSpace >= 0 ? lower.indexOf(' ', firstSpace + 1) : -1;
+                endPos = secondSpace >= 0 ? secondSpace : text.length();
+            }
+            break;
+        }
+    }
 
     if (pos < 0) {
         int heyPos = lower.indexOf("hey");
@@ -796,6 +1372,33 @@ bool extractWakeCommand(String& text) {
     }
 
     return true;
+}
+
+// ========================= STT FILTER =========================
+bool isJunkTranscript(const String& text) {
+    String t = text;
+    t.toLowerCase();
+    t.trim();
+
+    if (t.length() < 2) return true;
+
+    // Whisper hay sinh các câu này khi mic thu im lặng/nhiễu nền.
+    if (t.indexOf("subscribe") >= 0) return true;
+    if (t.indexOf("youtube") >= 0) return true;
+    if (t.indexOf("video") >= 0) return true;
+    if (t.indexOf("channel") >= 0) return true;
+    if (t.indexOf("like") >= 0 && t.indexOf("share") >= 0) return true;
+    if (t.indexOf("la la school") >= 0) return true;
+    if (t.indexOf("dang ky") >= 0 || t.indexOf("đăng ký") >= 0) return true;
+    if (t.indexOf("kenh") >= 0 || t.indexOf("kênh") >= 0) return true;
+    if (t.indexOf("youtube channel") >= 0) return true;
+    if (t.indexOf("khong bo lo") >= 0 || t.indexOf("không bỏ lỡ") >= 0) return true;
+    if (t.indexOf("nhung video hap dan") >= 0 || t.indexOf("những video hấp dẫn") >= 0) return true;
+    if (t.indexOf("cam on cac ban da xem") >= 0 || t.indexOf("cảm ơn các bạn đã xem") >= 0) return true;
+    if (t.indexOf("hen gap lai") >= 0 || t.indexOf("hẹn gặp lại") >= 0) return true;
+    if (t.indexOf("nho like") >= 0 || t.indexOf("nhớ like") >= 0) return true;
+
+    return false;
 }
 
 // ========================= LANGUAGE SWITCH DETECTION =========================
@@ -841,7 +1444,7 @@ int detectLanguageSwitch(const String& text) {
 // ========================= SETUP =========================
 void setup() {
     Serial.begin(115200);
-    delay(200);
+    delay(3000);  // Đợi USB-CDC reconnect sau reset để Serial Monitor bắt kịp
     Serial.println("\n=== AI Voice Assistant (Multilingual) ===");
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -862,33 +1465,54 @@ void setup() {
         while (true) delay(1000);
     }
 
+    Serial.println("[TFT] init start...");
+    Serial.flush();
     tft.init();
-    tft.setRotation(0);
-    tft.fillScreen(TFT_BLACK);
+    Serial.println("[TFT] init done");
+    Serial.flush();
+    tft.setRotation(1);  // Landscape: chữ và mặt robot nằm ngang
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, HIGH);
+    tft.fillScreen(TFT_BLACK);
+    Serial.println("[TFT] display ready");
+    Serial.flush();
 
+    Serial.println("[RGB] init..."); Serial.flush();
     rgb.begin();
     rgb.setBrightness(50);
     rgb.show();
+    Serial.println("[RGB] done"); Serial.flush();
 
     setState(STATE_BOOT);
     delay(500);
 
+    updateDisplay("SD INIT", "Dang doc the nho...", TFT_YELLOW);
     if (!initSDCard()) {
-        Serial.println("[WARN] Khong co SD");
+        Serial.println("[WARN] Khong co SD, fallback Google TTS");
     } else {
         loadProfile();
     }
 
+    updateDisplay("MIC INIT", "Dang khoi dong mic...", TFT_YELLOW);
+    Serial.println("[MIC] init..."); Serial.flush();
     if (!initMicI2S()) {
         Serial.println("[FATAL] Mic init fail");
         setState(STATE_ERROR);
         while (true) delay(1000);
     }
+    Serial.println("[MIC] done"); Serial.flush();
 
-    audio.setPinout(I2S_SPK_BCLK, I2S_SPK_LRC, I2S_SPK_DIN);
-    audio.setVolume(18);
+    updateDisplay("AUDIO INIT", "Dang khoi dong loa...", TFT_CYAN);
+    Serial.println("[AUDIO] init..."); Serial.flush();
+    audio = new Audio(false, 3, I2S_NUM_0);  // Speaker dùng I2S port 0 (Audio lib yêu cầu), mic dùng port 1
+    if (!audio) {
+        Serial.println("[FATAL] Audio malloc fail");
+        setState(STATE_ERROR);
+        while (true) delay(1000);
+    }
+    audio->setPinout(I2S_SPK_BCLK, I2S_SPK_LRC, I2S_SPK_DIN);
+    audio->setVolume(21);  // MAX volume (0-21)
+    Serial.println("[AUDIO] done"); Serial.flush();
 
     setState(STATE_WIFI_CONNECTING);
     WiFiManager wm;
@@ -900,66 +1524,120 @@ void setup() {
     }
     Serial.printf("[WiFi] OK %s\n", WiFi.localIP().toString().c_str());
 
+    // Phát câu chào khi khởi động xong
+    Serial.println("[BOOT] Playing greeting..."); Serial.flush();
+    updateDisplay("READY", "Xin chao! Hay noi gi di...", TFT_GREEN);
+    if (audio->connecttospeech("Xin chào! Mình là Jet, sẵn sàng nghe bạn.", "vi")) {
+        unsigned long t0 = millis();
+        while (audio->isRunning() && millis() - t0 < 10000) {
+            audio->loop();
+        }
+    }
+    Serial.println("[BOOT] Ready"); Serial.flush();
+
     setState(STATE_IDLE);
 }
 
 // ========================= LOOP =========================
 void loop() {
+    // --- Đang phát TTS ---
     if (currentState == STATE_SPEAKING) {
-        audio.loop();
-        if (!audio.isRunning()) {
+        if (audio) audio->loop();
+        if (!audio || !audio->isRunning()) {
             if (startNextTtsSegment()) {
-                return;
+                return;  // còn segment tiếp theo
             }
             saveConversation(lastUserText, lastAssistantText);
             resetTtsSegments();
+            // Trả lời xong thì đứng yên, không tự nghe tiếp để tránh mic bắt tiếng nền/YouTube.
+            inConversation = false;
+            Serial.println("[CONVO] TTS done, idle.");
             setState(STATE_IDLE);
         }
         return;
     }
 
-    if (currentState == STATE_IDLE &&
-        (digitalRead(BUTTON_PIN) == LOW || waitForSpeechStart())) {
+    // --- Chờ người dùng nói ---
+    if (currentState == STATE_IDLE) {
+        bool triggered = false;
+
         if (digitalRead(BUTTON_PIN) == LOW) {
             delay(40);
-            if (digitalRead(BUTTON_PIN) != LOW) return;
+            if (digitalRead(BUTTON_PIN) == LOW) {
+                triggered = true;
+                inConversation = false;
+            }
         }
 
+        if (!triggered) {
+            if (inConversation) {
+                // Đang trong conversation mode: chờ có tiếng nói hoặc timeout
+                unsigned long waitStart = millis();
+                int16_t pcm[MIC_CHUNK_SAMPLES];
+                uint8_t loudChunks = 0;
+                while (millis() - waitStart < CONVO_TIMEOUT_MS) {
+                    if (digitalRead(BUTTON_PIN) == LOW) { triggered = true; break; }
+                    uint32_t level = 0;
+                    size_t samples = readMicChunk(pcm, MIC_CHUNK_SAMPLES, &level);
+                    if (samples == 0) { delay(5); continue; }
+                    if (level >= VOICE_START_LEVEL) {
+                        loudChunks++;
+                        if (loudChunks >= VOICE_START_CHUNKS) {
+                            triggered = true;
+                            Serial.printf("[VAD] Speech in convo, level=%u\n", (unsigned)level);
+                            break;
+                        }
+                    } else if (loudChunks > 0) {
+                        loudChunks--;
+                    }
+                }
+                if (!triggered) {
+                    // Timeout — thoát conversation mode
+                    Serial.println("[CONVO] Timeout, exiting conversation");
+                    inConversation = false;
+                    updateDisplay("READY", "San sang nghe...", TFT_GREEN);
+                    return;
+                }
+            } else {
+                // Ngoài conversation: chờ wake word hoặc nút bấm
+                triggered = waitForSpeechStart();
+            }
+        }
+
+        if (!triggered) return;
+
+        unsigned long turnStartMs = millis();
         setState(STATE_LISTENING);
         size_t n = recordAudio();
+        unsigned long recDoneMs = millis();
         if (n < SAMPLE_RATE) {
             updateDisplay("TOO SHORT", "Noi lau hon mot chut.", TFT_ORANGE);
-            delay(1500);
+            delay(1000);
             setState(STATE_IDLE);
             return;
         }
 
         setState(STATE_TRANSCRIBING);
         String transcript = sendToGroqWhisper();
+        unsigned long sttDoneMs = millis();
         transcript.trim();
         if (transcript.isEmpty()) {
             updateDisplay("NO INPUT", "Thu lai.", TFT_ORANGE);
-            delay(1500);
+            delay(1000);
             setState(STATE_IDLE);
             return;
         }
         Serial.printf("[STT] %s\n", transcript.c_str());
 
-        if (!extractWakeCommand(transcript)) {
-            Serial.printf("[WAKE] Ignored, missing phrase: %s\n", WAKE_PHRASE);
-            setState(STATE_IDLE);
-            return;
-        }
-
-        if (transcript.isEmpty()) {
-            updateDisplay("WAKE OK", "Ban muon hoi gi?", TFT_CYAN);
-            delay(1200);
+        if (isJunkTranscript(transcript)) {
+            Serial.printf("[STT] Ignored junk: %s\n", transcript.c_str());
             setState(STATE_IDLE);
             return;
         }
 
         lastUserText = transcript;
-        Serial.printf("[WAKE] Command: %s\n", transcript.c_str());
+        inConversation = false;  // Push-to-talk: trả lời xong quay về trạng thái tĩnh
+        Serial.printf("[CMD] %s\n", transcript.c_str());
 
         // Phát hiện lệnh đổi ngôn ngữ
         int newLang = detectLanguageSwitch(transcript);
@@ -981,25 +1659,46 @@ void loop() {
 
         setState(STATE_THINKING);
         String reply = askDeepSeek(transcript);
+        unsigned long llmDoneMs = millis();
         reply.trim();
-        if (reply.isEmpty()) reply = "Xin loi, chua tra loi duoc.";
-        prepareTtsSegments(reply, currentLang);
+        if (reply.isEmpty() || isEchoReply(reply, transcript)) {
+            reply = "Mạng AI đang chậm nên mình chưa trả lời được. Bạn hỏi lại ngắn hơn một chút nhé.";
+            prepareSingleTtsSegment(reply, currentLang);
+        } else {
+            prepareTtsSegments(reply, currentLang);
+        }
         lastAssistantText = flattenTtsSegments();
         if (lastAssistantText.isEmpty()) lastAssistantText = reply;
+        if (isEchoReply(lastAssistantText, transcript)) {
+            reply = "Mạng AI đang chậm nên mình chưa trả lời được. Bạn hỏi lại ngắn hơn một chút nhé.";
+            prepareSingleTtsSegment(reply, currentLang);
+            lastAssistantText = reply;
+        }
         Serial.printf("[LLM raw] %s\n", reply.c_str());
         Serial.printf("[LLM text] %s\n", lastAssistantText.c_str());
+        Serial.printf("[TIME] rec=%lums stt=%lums llm=%lums total_to_text=%lums\n",
+                      recDoneMs - turnStartMs,
+                      sttDoneMs - recDoneMs,
+                      llmDoneMs - sttDoneMs,
+                      llmDoneMs - turnStartMs);
 
         if (startNextTtsSegment()) {
             setState(STATE_SPEAKING);
         } else {
-            updateDisplay("TTS FAIL", lastAssistantText, TFT_ORANGE);
-            delay(2500);
-            saveConversation(lastUserText, lastAssistantText);
-            setState(STATE_IDLE);
+            // TTS fail: thử phát bằng Google TTS trực tiếp
+            Serial.println("[TTS] ElevenLabs fail, trying Google...");
+            if (speakViaGoogleTtsDirect(lastAssistantText, currentLang)) {
+                setState(STATE_SPEAKING);
+            } else {
+                updateDisplay("TTS FAIL", lastAssistantText, TFT_ORANGE);
+                delay(2500);
+                saveConversation(lastUserText, lastAssistantText);
+                setState(STATE_IDLE);
+            }
         }
     }
 
-    delay(10);
+    delay(5);
 }
 
 // ========================= CALLBACKS AUDIO LIB =========================

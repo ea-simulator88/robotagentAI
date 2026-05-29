@@ -14,9 +14,14 @@ Context inject vào system prompt mỗi lượt (qua `format_progress_note`):
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# Pending switch tự reset sau khoảng này nếu bé không xác nhận lại.
+# 10 phút đủ để bé cân nhắc nhưng không kẹt mãi nếu bé bỏ giữa chừng.
+PENDING_SWITCH_TTL_SECONDS = 10 * 60
 
 
 class SGKProgress:
@@ -24,6 +29,9 @@ class SGKProgress:
         self.path = path
         self.max_entries = max_entries
         self.entries: list[dict] = []
+        # State "đang đợi bé xác nhận chuyển sách". Lưu cả original transcript
+        # để replay request gốc sau khi bé OK.
+        self.pending_switch: dict[str, Any] | None = None
         self._load()
 
     # ---- persistence ----
@@ -32,15 +40,24 @@ class SGKProgress:
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("learned"), list):
-                self.entries = [e for e in data["learned"] if isinstance(e, dict)]
+            if isinstance(data, dict):
+                if isinstance(data.get("learned"), list):
+                    self.entries = [
+                        e for e in data["learned"] if isinstance(e, dict)
+                    ]
+                ps = data.get("pending_switch")
+                if isinstance(ps, dict):
+                    self.pending_switch = ps
         except Exception as e:
             print(f"[SGKProgress] Load fail: {e} — bắt đầu rỗng")
             self.entries = []
+            self.pending_switch = None
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"learned": self.entries}
+        payload: dict[str, Any] = {"learned": self.entries}
+        if self.pending_switch:
+            payload["pending_switch"] = self.pending_switch
         self.path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -79,7 +96,86 @@ class SGKProgress:
 
     def clear(self) -> None:
         self.entries = []
+        self.pending_switch = None
         self._save()
+
+    # ---- switch confirmation state machine ----
+    def most_recent_book(self) -> dict[str, Any] | None:
+        """Cuốn đang học gần nhất — (subject, grade, tap) từ entry mới nhất."""
+        if not self.entries:
+            return None
+        e = self.entries[-1]
+        return {
+            "subject": e.get("subject"),
+            "grade": e.get("grade"),
+            "tap": e.get("tap"),
+        }
+
+    def most_recent_entry(self) -> dict[str, Any] | None:
+        return self.entries[-1] if self.entries else None
+
+    def set_pending_switch(
+        self,
+        from_book: dict[str, Any],
+        to_book: dict[str, Any],
+        original_transcript: str = "",
+        book_key: str | None = None,
+        lesson_number: int | None = None,
+        page_number: int | None = None,
+    ) -> None:
+        self.pending_switch = {
+            "from": from_book,
+            "to": to_book,
+            "original_transcript": original_transcript,
+            "book_key": book_key,
+            "lesson_number": lesson_number,
+            "page_number": page_number,
+            "asked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self._save()
+
+    def clear_pending_switch(self) -> None:
+        if self.pending_switch is not None:
+            self.pending_switch = None
+            self._save()
+
+    def pending_expired(self, ttl_seconds: int = PENDING_SWITCH_TTL_SECONDS) -> bool:
+        """True nếu pending đã quá hạn (bé bỏ ngang, không xác nhận)."""
+        if not self.pending_switch:
+            return True
+        asked = self.pending_switch.get("asked_at")
+        if not asked:
+            return True
+        try:
+            asked_dt = datetime.fromisoformat(asked)
+        except ValueError:
+            return True
+        return (datetime.now() - asked_dt).total_seconds() > ttl_seconds
+
+    def active_pending(self) -> dict[str, Any] | None:
+        """Trả pending nếu còn hiệu lực; tự xoá nếu hết hạn."""
+        if not self.pending_switch:
+            return None
+        if self.pending_expired():
+            self.clear_pending_switch()
+            return None
+        return self.pending_switch
+
+    def is_confirming_pending(self, transcript: str) -> bool:
+        """Bé có đang xác nhận pending switch không?
+
+        Match nếu transcript chứa 'lớp X' đúng với target grade của pending —
+        đủ explicit, không nhầm với câu chuyện khác. KHÔNG match riêng chữ
+        'ừ' không kèm số lớp vì dễ false-positive (bé 'ừ' khi đáp câu khác).
+        """
+        pending = self.active_pending()
+        if pending is None:
+            return False
+        to_grade = (pending.get("to") or {}).get("grade")
+        if to_grade is None:
+            return False
+        m = re.search(r"l[ớo]p\s*(\d)", transcript.lower())
+        return bool(m and int(m.group(1)) == to_grade)
 
     # ---- accessors ----
     def __len__(self) -> int:
@@ -141,6 +237,91 @@ class SGKProgress:
             if book_p > highest:
                 return lesson
         return None
+
+
+# =============================================================
+#  Helpers cho switch flow (dùng từ test.py)
+# =============================================================
+def books_equal(a: dict | None, b: dict | None) -> bool:
+    """So sánh (subject, grade, tap). None ≠ None — caller phải tự check None."""
+    if a is None or b is None:
+        return False
+    return (
+        a.get("subject") == b.get("subject")
+        and a.get("grade") == b.get("grade")
+        and a.get("tap") == b.get("tap")
+    )
+
+
+def book_label(book: dict | None) -> str:
+    """Hiển thị tên cuốn cho bé: 'Tiếng Việt lớp 2 tập 1'."""
+    if not book:
+        return "?"
+    subj = book.get("subject")
+    subj_name = "Tiếng Việt" if subj == "tiengviet" else "Toán" if subj == "toan" else (subj or "?")
+    return f"{subj_name} lớp {book.get('grade', '?')} tập {book.get('tap', '?')}"
+
+
+def build_switch_confirmation_text(
+    current_book: dict,
+    requested_book: dict,
+    recent_entry: dict | None,
+    next_lesson: dict | None,
+) -> str:
+    """Câu nhắc bé đang học cuốn cũ + hỏi xác nhận chuyển. Dùng giọng bạn bè
+    "mình/tớ - bạn" giống SGK Teacher persona."""
+    cur_label = book_label(current_book)
+    req_label = book_label(requested_book)
+
+    parts: list[str] = []
+    if recent_entry:
+        page_label = recent_entry.get("page_label") or f"trang {recent_entry.get('page')}"
+        parts.append(
+            f"Khoan nhé bạn! Hôm trước ngày {recent_entry.get('date')} "
+            f"mình với bạn đang học {cur_label} {page_label} mà."
+        )
+    else:
+        parts.append(f"Khoan nhé bạn! Bạn đang học {cur_label} đó.")
+
+    if next_lesson:
+        nxt_p = next_lesson.get("book_page") or next_lesson.get("pdf_page")
+        title = next_lesson.get("title") or f"trang {nxt_p}"
+        parts.append(
+            f"Mình đề xuất học tiếp {title} của {cur_label} cho liền mạch nha."
+        )
+    else:
+        parts.append(f"Mình nên học tiếp {cur_label} cho liền mạch nha.")
+
+    parts.append(
+        f"Nếu bạn thật sự muốn chuyển sang {req_label} thì nói lại 1 lần nữa "
+        f"'mình muốn học lớp {requested_book.get('grade')}' nha. "
+        f"Bạn muốn học tiếp {cur_label} hay chuyển hẳn sang {req_label}?"
+    )
+    return " ".join(parts)
+
+
+def build_no_lesson_text(toc_info: dict[str, Any]) -> str:
+    """Khi vision tra mục lục mà không thấy bài N → nói thật + hỏi lại có phải
+    bé muốn nói TRANG N không. Tránh AI bịa nội dung bài không có thật."""
+    n = toc_info.get("lesson_number")
+    subj_name = toc_info.get("subject_name", "?")
+    grade = toc_info.get("grade", "?")
+    tap = toc_info.get("tap", "?")
+    return (
+        f"Mình tra mục lục {subj_name} lớp {grade} tập {tap} mà không thấy bài "
+        f"{n} bạn ơi. Có phải bạn muốn học TRANG {n} không? "
+        f"Hoặc bạn nói lại số bài khác cho mình nha."
+    )
+
+
+def build_ambiguous_subject_text(lesson_or_page_label: str = "") -> str:
+    """Khi bé yêu cầu SGK rõ ràng (có 'bài/trang/lớp/tập/giảng') nhưng KHÔNG
+    nói môn nào, và bé cũng chưa từng học gì → hỏi lại chọn môn. Tránh đoán bậy."""
+    suffix = f" ({lesson_or_page_label})" if lesson_or_page_label else ""
+    return (
+        f"Bạn muốn học môn nào nhỉ{suffix} — Toán hay Tiếng Việt? "
+        f"Bạn nói rõ giúp mình với nha."
+    )
 
 
 # =============================================================

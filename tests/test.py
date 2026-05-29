@@ -58,12 +58,28 @@ from py.search import brave_search, format_for_llm as format_search_for_llm
 from py.sgk_teacher import (
     SGK_DIR,
     build_vision_user_content,
+    detect_subject,
+    find_book_key,
     find_relevant_pages,
+    find_toc_lookup,
+    has_continuation_hint,
+    has_explicit_page_or_lesson,
+    has_sgk_intent,
+    image_to_base64,
     load_lessons,
     load_master_index,
+    load_page_by_book_page,
     render_sgk_system_prompt,
 )
-from py.sgk_progress import SGKProgress, format_progress_note
+from py.sgk_progress import (
+    SGKProgress,
+    book_label,
+    books_equal,
+    build_ambiguous_subject_text,
+    build_no_lesson_text,
+    build_switch_confirmation_text,
+    format_progress_note,
+)
 from py.common import (
     ALL_LANG_CODES,
     DEEPSEEK_API_KEY,
@@ -292,6 +308,66 @@ def llm_vision(
         return (resp.choices[0].message.content or "").strip()
     except (AttributeError, IndexError):
         return ""
+
+
+def vision_toc_lookup(client: Groq, toc_info: dict) -> int | None:
+    """Gửi ảnh MỤC LỤC + hỏi 'Bài N ở trang nào?' lên Groq vision → parse số trang.
+
+    Dùng max_tokens nhỏ (50) + temperature thấp (0.1) vì output mong đợi chỉ là
+    1 con số. Parse: lấy số 1-3 chữ số đầu tiên trong câu trả lời.
+    """
+    lesson_num = toc_info["lesson_number"]
+    book_label = (
+        f"{toc_info.get('subject_name')} lớp {toc_info.get('grade')} "
+        f"tập {toc_info.get('tap')}"
+    )
+    text_prompt = (
+        f"Đây là các trang MỤC LỤC của sách {book_label}. "
+        f"Tìm BÀI {lesson_num} (Bài {lesson_num}) trong mục lục và cho biết bài đó "
+        f"nằm ở TRANG SỐ NÀO của sách.\n"
+        f"CHỈ trả về duy nhất 1 số tự nhiên (số trang in trên sách, 1-200). "
+        f"Nếu không tìm thấy bài {lesson_num} trong mục lục → trả về 0. "
+        f"KHÔNG giải thích gì thêm."
+    )
+    user_content: list[dict] = [{"type": "text", "text": text_prompt}]
+    for p in toc_info["toc_pages"]:
+        try:
+            b64 = image_to_base64(p["path"])
+        except Exception as e:
+            print(f"  ⚠ Encode TOC {p.get('file')} fail: {e}")
+            continue
+        user_content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{b64}",
+                "detail": "high",
+            },
+        })
+    if len(user_content) == 1:
+        return None  # không encode được TOC nào
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Bạn là trợ lý đọc mục lục sách giáo khoa Việt Nam. "
+                "Trả lời CỰC NGẮN, chỉ 1 số trang, không câu chữ thừa."
+            ),
+        },
+        {"role": "user", "content": user_content},
+    ]
+    answer = llm_vision(client, messages, max_tokens=50, temperature=0.1)
+    if not answer:
+        return None
+    m = re.search(r"\b(\d{1,3})\b", answer)
+    if not m:
+        print(f"     ↪ Mục lục không parse được số: {answer[:80]!r}")
+        return None
+    n = int(m.group(1))
+    if n == 0 or not (1 <= n <= 300):
+        print(f"     ↪ Mục lục trả {n} → không hợp lệ ({answer[:80]!r})")
+        return None
+    return n
 
 
 def tts(voice: str, text: str, out: Path, retries: int = 2) -> Path:
@@ -860,16 +936,197 @@ def one_round(
     sgk_pages: list[dict] = []
     sgk_next_lesson: dict | None = None
     sgk_master_idx: dict | None = None
+    hijack_no_lesson_answer: str | None = None
+    hijack_ask_subject_answer: str | None = None
     if not intent_handled and not search_context and detected_key == "vi":
-        try:
-            sgk_master_idx = load_master_index(SGK_DIR)
-            sgk_pages = find_relevant_pages(
-                transcript, sgk_master_idx, SGK_DIR, max=2
+        # ----- Phân loại câu hỏi -----
+        sgk_intent = has_sgk_intent(transcript)
+        has_subject = detect_subject(transcript) is not None
+        has_pgls = has_explicit_page_or_lesson(transcript)
+        has_grade_explicit = bool(re.search(r"l[ớo]p\s*\d", transcript.lower()))
+        has_continuation = has_continuation_hint(transcript)
+
+        cur_book = sgk_progress.most_recent_book()
+        last_entry = sgk_progress.most_recent_entry()
+        # Grade default từ progress thay vì hard-code 2 — tránh câu "Trang 30"
+        # (không có lớp) bị route sang lớp 2 khi bé đang học lớp 1.
+        default_grade = cur_book["grade"] if cur_book and cur_book.get("grade") else 2
+
+        sgk_explicit = sgk_intent or has_pgls or has_grade_explicit
+        # Follow-up: bé hỏi tiếp về bài đang học. VD "Còn các hình khác?",
+        # "Thì sao", "Còn nữa không?" — không nhắc page/lesson/lớp mới nhưng
+        # có keyword môn và có continuation phrase. KHÔNG được đổi sách.
+        is_follow_up = (
+            not sgk_explicit
+            and has_subject
+            and has_continuation
+            and last_entry is not None
+        )
+
+        # Bỏ qua hẳn SGK pipeline khi câu không có signal SGK rõ ràng VÀ không
+        # phải follow-up. VD "cộng 5 với 3 bằng mấy" → subject=toán nhưng đó là
+        # câu toán thuần, không phải hỏi sách → để chat mode trả lời.
+        run_sgk = sgk_explicit or is_follow_up
+        if not run_sgk:
+            sgk_intent = False  # signal cho hijack ask_subject phía dưới
+            has_subject = False
+
+        if run_sgk:
+            # Subject fallback: nếu bé nói SGK mà thiếu môn → suy ra từ progress.
+            # VD bé hôm qua học tiếng việt, hôm nay nói "giảng bài 20 lớp 1 tập 1"
+            # → tự hiểu là tiếng việt theo progress.
+            lookup_transcript = transcript
+            if sgk_intent and not has_subject:
+                if cur_book and cur_book.get("subject"):
+                    subj_word = "Toán" if cur_book["subject"] == "toan" else "Tiếng Việt"
+                    lookup_transcript = f"{subj_word} {transcript}"
+                    print(
+                        f"  ↪ SGK intent + thiếu môn → suy ra '{subj_word}' từ progress"
+                    )
+
+            try:
+                sgk_master_idx = load_master_index(SGK_DIR)
+            except FileNotFoundError:
+                sgk_master_idx = None  # SGK chưa setup → bỏ qua, dùng chat thường
+            except Exception as e:
+                print(f"  ⚠ Load master_index fail: {type(e).__name__}: {e}")
+                sgk_master_idx = None
+
+            if sgk_master_idx is not None and is_follow_up:
+                # FOLLOW-UP: re-use trang đang học. Không chạy fresh lookup
+                # tránh sai book/page.
+                try:
+                    fu_book_key = find_book_key(
+                        sgk_master_idx,
+                        last_entry["subject"],
+                        last_entry["grade"],
+                        last_entry.get("tap"),
+                    )
+                    if fu_book_key:
+                        sgk_pages = load_page_by_book_page(
+                            sgk_master_idx, SGK_DIR,
+                            fu_book_key, last_entry["page"],
+                            lesson_number=last_entry.get("lesson_number"),
+                        )
+                        if sgk_pages:
+                            print(
+                                f"  ↩️ Follow-up: re-use {sgk_pages[0]['subject_name']}"
+                                f" lớp {sgk_pages[0]['grade']} tập {sgk_pages[0].get('tap', '?')}"
+                                f" trang {sgk_pages[0]['page']}"
+                            )
+                except Exception as e:
+                    print(f"  ⚠ Follow-up reuse fail: {type(e).__name__}: {e}")
+            elif sgk_master_idx is not None:
+                try:
+                    sgk_pages = find_relevant_pages(
+                        lookup_transcript, sgk_master_idx, SGK_DIR, max=2,
+                        default_grade=default_grade,
+                    )
+                except Exception as e:
+                    print(f"  ⚠ SGK lookup fail: {type(e).__name__}: {e}")
+
+        # Nếu chưa tìm được trang trực tiếp → thử TOC lookup ("bài N").
+        if not sgk_pages and sgk_master_idx is not None and not is_follow_up:
+            toc_info = find_toc_lookup(
+                lookup_transcript, sgk_master_idx, SGK_DIR,
+                default_grade=default_grade,
             )
-        except FileNotFoundError:
-            pass  # SGK chưa setup → bỏ qua, dùng chat thường
-        except Exception as e:
-            print(f"  ⚠ SGK lookup fail: {type(e).__name__}: {e}")
+            if toc_info:
+                print(
+                    f"  📑 Tra mục lục bài {toc_info['lesson_number']} "
+                    f"trong {toc_info['subject_name']} lớp {toc_info['grade']} "
+                    f"tập {toc_info['tap']} "
+                    f"({len(toc_info['toc_pages'])} trang TOC)..."
+                )
+                with stopwatch("TOC", timings):
+                    try:
+                        book_page = vision_toc_lookup(client, toc_info)
+                    except Exception as e:
+                        print(f"  ⚠ TOC vision fail: {type(e).__name__}: {e}")
+                        book_page = None
+                if book_page:
+                    print(f"     ↪ Bài {toc_info['lesson_number']} → trang {book_page}")
+                    try:
+                        sgk_pages = load_page_by_book_page(
+                            sgk_master_idx, SGK_DIR,
+                            toc_info["book_key"], book_page,
+                            lesson_number=toc_info["lesson_number"],
+                        )
+                    except Exception as e:
+                        print(f"  ⚠ Load trang {book_page} fail: {type(e).__name__}: {e}")
+                else:
+                    print("     ↪ Không tra được trang từ mục lục.")
+
+                # Vision tra mục lục KHÔNG thấy bài (hoặc load page fail)
+                # → KHÔNG fall through chat mode (sẽ bịa). Hỏi lại có phải trang N.
+                if not sgk_pages:
+                    no_lesson_text = build_no_lesson_text(toc_info)
+                    hijack_no_lesson_answer = json.dumps(
+                        {"segments": [{"lang": "vi", "text": no_lesson_text}]},
+                        ensure_ascii=False,
+                    )
+                    print(
+                        f"  🚫 Không thấy bài {toc_info['lesson_number']} trong mục lục — "
+                        f"hỏi lại bé có phải trang {toc_info['lesson_number']} không."
+                    )
+
+        # Bé có SGK intent rõ rệt (giảng/bài/lớp/tập) nhưng không có môn và
+        # cũng không có progress để fallback → hỏi lại môn, đừng chat-mode hallucinate.
+        if (
+            not sgk_pages
+            and hijack_no_lesson_answer is None
+            and sgk_intent
+            and not has_subject
+            and sgk_progress.most_recent_book() is None
+        ):
+            ask_text = build_ambiguous_subject_text()
+            hijack_ask_subject_answer = json.dumps(
+                {"segments": [{"lang": "vi", "text": ask_text}]},
+                ensure_ascii=False,
+            )
+            print("  🚫 SGK intent nhưng thiếu môn + progress rỗng — hỏi lại môn.")
+
+        # Nếu pending switch còn hiệu lực và bé NÓI LẠI 'lớp X' (target grade)
+        # mà lượt này chưa resolve được sgk_pages → replay request gốc.
+        if (
+            not sgk_pages
+            and sgk_master_idx is not None
+            and sgk_progress.is_confirming_pending(transcript)
+        ):
+            pending = sgk_progress.active_pending() or {}
+            orig_q = pending.get("original_transcript", "")
+            if orig_q:
+                print(
+                    f"  ✅ Bé xác nhận chuyển sách qua 'lớp "
+                    f"{pending.get('to', {}).get('grade')}'. Replay: {orig_q!r}"
+                )
+                try:
+                    sgk_pages = find_relevant_pages(
+                        orig_q, sgk_master_idx, SGK_DIR, max=2
+                    )
+                except Exception as e:
+                    print(f"  ⚠ Replay find fail: {type(e).__name__}: {e}")
+                if not sgk_pages:
+                    toc_replay = find_toc_lookup(orig_q, sgk_master_idx, SGK_DIR)
+                    if toc_replay:
+                        print(
+                            f"  📑 Replay TOC lookup bài "
+                            f"{toc_replay['lesson_number']}..."
+                        )
+                        with stopwatch("TOC", timings):
+                            try:
+                                book_page = vision_toc_lookup(client, toc_replay)
+                            except Exception as e:
+                                print(f"  ⚠ Replay TOC fail: {type(e).__name__}: {e}")
+                                book_page = None
+                        if book_page:
+                            sgk_pages = load_page_by_book_page(
+                                sgk_master_idx, SGK_DIR,
+                                toc_replay["book_key"], book_page,
+                                lesson_number=toc_replay["lesson_number"],
+                            )
+            sgk_progress.clear_pending_switch()
+
         if sgk_pages:
             head = sgk_pages[0]
             pages_str = ", ".join("trang " + str(p["page"]) for p in sgk_pages)
@@ -903,8 +1160,107 @@ def one_round(
                 )
                 print(f"  ➡️  Bài kế tiếp đề xuất: trang {nxt_p}")
 
+    # =========================================================
+    # Switch confirmation: nếu bé yêu cầu sách khác cuốn đang học
+    # → lần 1 nhắc + đợi xác nhận. Lần 2 mới thật sự chuyển.
+    # Bỏ qua bước này nếu lượt này là REPLAY (pending đã cleared ở trên).
+    # =========================================================
+    hijack_switch_answer: str | None = None
+    if (
+        not intent_handled
+        and not search_context
+        and detected_key == "vi"
+        and sgk_pages
+        and sgk_master_idx is not None
+    ):
+        p0 = sgk_pages[0]
+        requested_book = {
+            "subject": p0["subject"],
+            "grade": p0["grade"],
+            "tap": p0.get("tap"),
+        }
+        current_book = sgk_progress.most_recent_book()
+        pending = sgk_progress.active_pending()
+
+        if pending and books_equal(requested_book, pending.get("to")):
+            # Bé lặp lại đúng request → confirm switch
+            print(f"  ✅ Xác nhận chuyển sách: {book_label(requested_book)}")
+            sgk_progress.clear_pending_switch()
+        elif (
+            current_book is not None
+            and not books_equal(current_book, requested_book)
+        ):
+            # Lần đầu yêu cầu cuốn khác → hỏi xác nhận
+            print(
+                f"  🚦 Phát hiện chuyển sách: {book_label(current_book)} "
+                f"→ {book_label(requested_book)}. Đợi bé xác nhận."
+            )
+            recent_entry = sgk_progress.most_recent_entry()
+            cur_next: dict | None = None
+            try:
+                cur_lessons = load_lessons(
+                    sgk_master_idx, SGK_DIR,
+                    current_book["subject"],
+                    current_book["grade"],
+                    current_book.get("tap"),
+                )
+                cur_next = sgk_progress.next_lesson(
+                    current_book["subject"],
+                    current_book["grade"],
+                    current_book.get("tap"),
+                    cur_lessons,
+                )
+            except Exception as e:
+                print(f"  ⚠ Compute current next_lesson fail: {e}")
+
+            # Tìm book_key của cuốn bé yêu cầu để replay sau khi xác nhận
+            requested_book_key: str | None = None
+            for key, info in sgk_master_idx.get("subjects", {}).items():
+                if (
+                    info.get("subject") == requested_book["subject"]
+                    and info.get("grade") == requested_book["grade"]
+                    and info.get("tap") == requested_book["tap"]
+                ):
+                    requested_book_key = key
+                    break
+
+            confirmation_text = build_switch_confirmation_text(
+                current_book, requested_book, recent_entry, cur_next,
+            )
+            source = p0.get("source", "")
+            page_number = p0.get("page") if source.startswith("trang") else None
+            sgk_progress.set_pending_switch(
+                from_book=current_book,
+                to_book=requested_book,
+                original_transcript=transcript,
+                book_key=requested_book_key,
+                lesson_number=p0.get("lesson_number"),
+                page_number=page_number,
+            )
+            hijack_switch_answer = json.dumps(
+                {"segments": [{"lang": "vi", "text": confirmation_text}]},
+                ensure_ascii=False,
+            )
+            # Không gọi vision, không ghi progress cho lượt này
+            sgk_pages = []
+            sgk_next_lesson = None
+        else:
+            # Cùng cuốn (hoặc lần đầu chưa có progress) → xoá pending dư thừa
+            if pending:
+                sgk_progress.clear_pending_switch()
+
+    # Gom 3 nguồn hijack: switch confirm, no-lesson (TOC trả 0), ask-subject.
+    # Tất cả đều bypass LLM call và dùng text deterministic.
+    hijack_answer: str | None = (
+        hijack_switch_answer or hijack_no_lesson_answer or hijack_ask_subject_answer
+    )
+
     if not intent_handled:
-        if sgk_pages:
+        if hijack_answer is not None:
+            # Hijack reply — deterministic, không cần LLM call (tránh hallucinate)
+            answer = hijack_answer
+            messages = None  # type: ignore[assignment]
+        elif sgk_pages:
             # SGK teacher mode: vision message với ảnh SGK + system prompt cô giáo
             progress_note = format_progress_note(
                 sgk_progress,
@@ -957,30 +1313,31 @@ def one_round(
                     *memory.for_llm(),
                     {"role": "user", "content": transcript},
                 ]
-        with stopwatch("LLM", timings):
-            if sgk_pages:
-                # SGK pipeline → Groq vision. DeepSeek-chat không nhận image_url.
-                answer = llm_vision(client, messages)
-                if not (answer or "").strip():
-                    print("  ⚠ Vision LLM rỗng — không có retry strategy riêng.")
-            else:
-                answer = llm(messages)
-                if not (answer or "").strip():
-                    print("  ⚠ LLM rỗng — retry 1: temp=0.2 + json_object.")
-                    try:
-                        answer = llm(messages, temperature=0.2)
-                    except Exception as e:
-                        print(f"  ⚠ Retry 1 fail: {type(e).__name__}: {e}")
-                        answer = ""
-                if not (answer or "").strip():
-                    # DeepSeek json_object mode đôi khi bị kẹt sinh ra ' ' rồi stop.
-                    # Bỏ json_mode → model tự do trả text; splitter Python sẽ tự chia segment.
-                    print("  ⚠ LLM rỗng — retry 2: bỏ json_object mode.")
-                    try:
-                        answer = llm(messages, temperature=0.5, json_mode=False)
-                    except Exception as e:
-                        print(f"  ⚠ Retry 2 fail: {type(e).__name__}: {e}")
-                        answer = ""
+        if hijack_answer is None:
+            with stopwatch("LLM", timings):
+                if sgk_pages:
+                    # SGK pipeline → Groq vision. DeepSeek-chat không nhận image_url.
+                    answer = llm_vision(client, messages)
+                    if not (answer or "").strip():
+                        print("  ⚠ Vision LLM rỗng — không có retry strategy riêng.")
+                else:
+                    answer = llm(messages)
+                    if not (answer or "").strip():
+                        print("  ⚠ LLM rỗng — retry 1: temp=0.2 + json_object.")
+                        try:
+                            answer = llm(messages, temperature=0.2)
+                        except Exception as e:
+                            print(f"  ⚠ Retry 1 fail: {type(e).__name__}: {e}")
+                            answer = ""
+                    if not (answer or "").strip():
+                        # DeepSeek json_object mode đôi khi bị kẹt sinh ra ' ' rồi stop.
+                        # Bỏ json_mode → model tự do trả text; splitter Python sẽ tự chia segment.
+                        print("  ⚠ LLM rỗng — retry 2: bỏ json_object mode.")
+                        try:
+                            answer = llm(messages, temperature=0.5, json_mode=False)
+                        except Exception as e:
+                            print(f"  ⚠ Retry 2 fail: {type(e).__name__}: {e}")
+                            answer = ""
         if not (answer or "").strip():
             print("  ⚠ LLM vẫn rỗng — dùng câu xin lỗi mặc định.")
             answer = json.dumps(

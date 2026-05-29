@@ -18,7 +18,7 @@ Bot học tập cho trẻ em, hỗ trợ 4 ngôn ngữ, chạy trên ESP32-S3.
 | Loa | 8 Ω · 1 W · 30 mm |
 | Dây | Jumper Đực–Cái 21 cm + Cái–Cái 20 cm |
 | Pin | LiPo 3.7 V (mua tại VN) |
-| MicroSD | 8 GB Class 10 |
+| MicroSD | 32 GB, FAT32 nếu format được |
 
 ---
 
@@ -26,13 +26,13 @@ Bot học tập cho trẻ em, hỗ trợ 4 ngôn ngữ, chạy trên ESP32-S3.
 
 | Module | Chân |
 |---|---|
-| **INMP441 mic** | SCK → GPIO4 · SD → GPIO6 · WS → GPIO5 · L/R → GND · VDD → 3.3 V |
-| **MAX98357 amp** | BCLK → GPIO15 · DIN → GPIO7 · LRC → GPIO16 |
-| **MicroSD (SPI)** | CS → GPIO34 · MOSI → GPIO35 · MISO → GPIO37 · SCLK → GPIO36 |
+| **INMP441 mic** | VDD → 3V3 · GND → G · SCK → GPIO4 · WS → GPIO5 · SD → GPIO6 · L/R → GND |
+| **MAX98357 amp** | VIN → VBUS (5V) · GND → G chung · LRC → GPIO7 · BCLK → GPIO8 · DIN → GPIO9 · SD bỏ trống · GAIN bỏ trống |
+| **MicroSD/TF onboard (SDMMC)** | CLK → GPIO14 · CMD → GPIO15 · D0 → GPIO16 · D1 → GPIO18 · D2 → GPIO17 · D3 → GPIO21 |
 | **RGB LED** | GPIO38 (NeoPixel WS2812 onboard) |
 | **Button** | GPIO0 (BOOT, INPUT_PULLUP) |
 
-> Chân LCD (ST7789) định nghĩa trong `platformio.ini` qua TFT_eSPI build flags: MOSI=45, SCLK=40, CS=42, DC=41, RST=39, BL=48.
+> Chân LCD (ST7789) định nghĩa trong `platformio.ini` qua TFT_eSPI build flags: MOSI=45, SCLK=40, CS=42, DC=41, RST=39, BL=46.
 
 ---
 

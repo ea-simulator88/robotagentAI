@@ -18,38 +18,74 @@ from PIL import Image
 import io
 
 # ── Cấu hình tối ưu cho ESP32 Vision ──────────────────────────────────────────
-DPI         = 120          # Đủ rõ cho Vision AI, không quá nặng
-JPEG_QUALITY= 82           # 80-85 là sweet spot: chất lượng tốt, file nhỏ
-MAX_WIDTH   = 900          # px — resize nếu quá rộng
-MAX_HEIGHT  = 1260         # px — resize nếu quá cao
-TARGET_KB   = 150          # KB target mỗi trang (thông tin, không hard limit)
+DPI = 120  # Đủ rõ cho Vision AI, không quá nặng
+JPEG_QUALITY = 82  # 80-85 là sweet spot: chất lượng tốt, file nhỏ
+MAX_WIDTH = 900  # px — resize nếu quá rộng
+MAX_HEIGHT = 1260  # px — resize nếu quá cao
+TARGET_KB = 150  # KB target mỗi trang (thông tin, không hard limit)
+
+# ── Offset: pdf_page → book_page ──────────────────────────────────────────────
+# SGK Chân trời sáng tạo có trang bìa ở đầu → PDF lệch 1 so với số trang in sách
+# book_page = pdf_page - PAGE_OFFSET
+# Ví dụ: pdf_page=6 → book_page=5 → lưu thành page_005.jpg
+PAGE_OFFSET = 1
 
 # ── Từ khóa nhận diện loại trang ──────────────────────────────────────────────
 PAGE_TYPE_KEYWORDS = {
-    "muc_luc":    ["mục lục", "table of contents", "nội dung"],
-    "loi_noi_dau":["lời nói đầu", "lời giới thiệu", "hướng dẫn sử dụng"],
-    "on_tap":     ["ôn tập", "ôn tập học kì", "tổng kết"],
-    "thuc_hanh":  ["thực hành", "trải nghiệm"],
-    "bai_hoc":    [],  # default
+    "muc_luc": ["mục lục", "table of contents", "nội dung"],
+    "loi_noi_dau": ["lời nói đầu", "lời giới thiệu", "hướng dẫn sử dụng"],
+    "on_tap": ["ôn tập", "ôn tập học kì", "tổng kết"],
+    "thuc_hanh": ["thực hành", "trải nghiệm"],
+    "bai_hoc": [],  # default
 }
 
 # Từ điển nhận diện chủ đề bài học từ tên file / subject
 SUBJECT_META = {
     "toan": {
         "ten_day_du": "Toán",
-        "keywords": ["số", "cộng", "trừ", "nhân", "chia", "hình", "đo", "bảng",
-                     "phép", "tính", "lít", "cm", "kg", "giờ", "ngày", "tháng",
-                     "ôn tập", "luyện tập", "thực hành"],
+        "keywords": [
+            "số",
+            "cộng",
+            "trừ",
+            "nhân",
+            "chia",
+            "hình",
+            "đo",
+            "bảng",
+            "phép",
+            "tính",
+            "lít",
+            "cm",
+            "kg",
+            "giờ",
+            "ngày",
+            "tháng",
+            "ôn tập",
+            "luyện tập",
+            "thực hành",
+        ],
     },
     "tiengviet": {
         "ten_day_du": "Tiếng Việt",
-        "keywords": ["đọc", "viết", "chính tả", "tập đọc", "kể chuyện", "luyện từ",
-                     "câu", "nghe", "nói", "chữ hoa", "bài thơ", "văn bản"],
+        "keywords": [
+            "đọc",
+            "viết",
+            "chính tả",
+            "tập đọc",
+            "kể chuyện",
+            "luyện từ",
+            "câu",
+            "nghe",
+            "nói",
+            "chữ hoa",
+            "bài thơ",
+            "văn bản",
+        ],
     },
     "tiengviet_tap1": {"ten_day_du": "Tiếng Việt tập 1"},
     "tiengviet_tap2": {"ten_day_du": "Tiếng Việt tập 2"},
-    "toan_tap1":      {"ten_day_du": "Toán tập 1"},
-    "toan_tap2":      {"ten_day_du": "Toán tập 2"},
+    "toan_tap1": {"ten_day_du": "Toán tập 1"},
+    "toan_tap2": {"ten_day_du": "Toán tập 2"},
 }
 
 
@@ -60,22 +96,24 @@ def detect_subject_from_filename(filename: str) -> tuple[str, int, int]:
     """
     name = filename.lower()
     # Grade
-    grade_match = re.search(r'lớp[_\s]*(\d)', name) or re.search(r'l[oô]p[_\s]*(\d)', name)
+    grade_match = re.search(r"lớp[_\s]*(\d)", name) or re.search(
+        r"l[oô]p[_\s]*(\d)", name
+    )
     grade = int(grade_match.group(1)) if grade_match else 0
     # Tập
-    tap_match = re.search(r'tập[_\s]*(\d)', name) or re.search(r'tap[_\s]*(\d)', name)
+    tap_match = re.search(r"tập[_\s]*(\d)", name) or re.search(r"tap[_\s]*(\d)", name)
     tap = int(tap_match.group(1)) if tap_match else 1
     # Subject
-    if 'toán' in name or 'toan' in name:
-        subject = 'toan'
-    elif 'tiếng việt' in name or 'tieng viet' in name or 'tiengviet' in name:
-        subject = 'tiengviet'
-    elif 'tiếng anh' in name or 'english' in name:
-        subject = 'english'
-    elif 'khoa học' in name or 'khoa hoc' in name:
-        subject = 'khoahoc'
+    if "toán" in name or "toan" in name:
+        subject = "toan"
+    elif "tiếng việt" in name or "tieng viet" in name or "tiengviet" in name:
+        subject = "tiengviet"
+    elif "tiếng anh" in name or "english" in name:
+        subject = "english"
+    elif "khoa học" in name or "khoa hoc" in name:
+        subject = "khoahoc"
     else:
-        subject = 'khac'
+        subject = "khac"
     return subject, grade, tap
 
 
@@ -103,7 +141,7 @@ def get_page_number_from_text(text: str) -> int | None:
     SGK thường có số trang ở cuối trang.
     """
     # Tìm số đơn lẻ ở cuối text (thường là số trang)
-    matches = re.findall(r'\b(\d{1,3})\b', text[-50:] if len(text) > 50 else text)
+    matches = re.findall(r"\b(\d{1,3})\b", text[-50:] if len(text) > 50 else text)
     if matches:
         try:
             num = int(matches[-1])
@@ -114,7 +152,9 @@ def get_page_number_from_text(text: str) -> int | None:
     return None
 
 
-def convert_pdf_to_jpg(pdf_path: str, output_dir: str, subject: str, grade: int, tap: int):
+def convert_pdf_to_jpg(
+    pdf_path: str, output_dir: str, subject: str, grade: int, tap: int
+):
     """
     Convert PDF → JPG tối ưu + tạo index.json thông minh.
     """
@@ -135,15 +175,15 @@ def convert_pdf_to_jpg(pdf_path: str, output_dir: str, subject: str, grade: int,
 
     # ── Index structure ────────────────────────────────────────────────────────
     index = {
-        "subject":      subject,
+        "subject": subject,
         "subject_name": SUBJECT_META.get(subject, {}).get("ten_day_du", subject),
-        "grade":        grade,
-        "tap":          tap,
-        "total_pages":  total_pages,
-        "pdf_source":   pdf_path.name,
-        "pages":        {},        # pdf_page_num → metadata
-        "book_pages":   {},        # book_page_num → pdf_page_num (để lookup nhanh)
-        "lessons":      [],        # list các bài học với trang bắt đầu
+        "grade": grade,
+        "tap": tap,
+        "total_pages": total_pages,
+        "pdf_source": pdf_path.name,
+        "pages": {},  # pdf_page_num → metadata
+        "book_pages": {},  # book_page_num → pdf_page_num (để lookup nhanh)
+        "lessons": [],  # list các bài học với trang bắt đầu
     }
 
     total_size = 0
@@ -152,6 +192,16 @@ def convert_pdf_to_jpg(pdf_path: str, output_dir: str, subject: str, grade: int,
     for page_num in range(total_pages):
         page = doc[page_num]
         pdf_page = page_num + 1  # 1-based
+
+        # ── Tính book_page = số trang in thực tế trong sách ───────────────────
+        # pdf_page lệch PAGE_OFFSET so với book_page vì PDF có trang bìa ở đầu
+        # Ví dụ: pdf_page=6 → book_page=5 → file = page_005.jpg (khớp mục lục)
+        book_page_num = pdf_page - PAGE_OFFSET
+        if book_page_num <= 0:
+            # Trang bìa / lời nói đầu (trước trang 1 của sách)
+            filename = f"cover_{pdf_page:03d}.jpg"
+        else:
+            filename = f"page_{book_page_num:03d}.jpg"
 
         # ── Render page ────────────────────────────────────────────────────────
         mat = fitz.Matrix(DPI / 72, DPI / 72)
@@ -168,8 +218,7 @@ def convert_pdf_to_jpg(pdf_path: str, output_dir: str, subject: str, grade: int,
             new_w, new_h = int(w * ratio), int(h * ratio)
             img = img.resize((new_w, new_h), Image.LANCZOS)
 
-        # Save JPEG
-        filename = f"page_{pdf_page:03d}.jpg"
+        # Save JPEG — tên file = page_{book_page}.jpg (khớp với số trang in sách)
         filepath = out_dir / filename
         img.save(str(filepath), "JPEG", quality=JPEG_QUALITY, optimize=True)
 
@@ -180,15 +229,16 @@ def convert_pdf_to_jpg(pdf_path: str, output_dir: str, subject: str, grade: int,
         # ── Extract metadata ───────────────────────────────────────────────────
         text = extract_text_from_page(page)
         page_type = detect_page_type(text, pdf_page)
-        book_page = get_page_number_from_text(text)
+        # book_page đã tính chính xác từ offset, không cần extract từ text nữa
+        book_page = book_page_num if book_page_num > 0 else None
 
         page_meta = {
-            "file":       filename,
-            "pdf_page":   pdf_page,
-            "book_page":  book_page,
-            "type":       page_type,
-            "size_kb":    round(file_size / 1024, 1),
-            "text_preview": text[:120].replace('\n', ' ') if text else "",
+            "file": filename,
+            "pdf_page": pdf_page,
+            "book_page": book_page,
+            "type": page_type,
+            "size_kb": round(file_size / 1024, 1),
+            "text_preview": text[:120].replace("\n", " ") if text else "",
         }
         index["pages"][str(pdf_page)] = page_meta
 
@@ -199,8 +249,10 @@ def convert_pdf_to_jpg(pdf_path: str, output_dir: str, subject: str, grade: int,
         # Progress
         if pdf_page % 20 == 0 or pdf_page == total_pages:
             avg_kb = total_size / pdf_page / 1024
-            print(f"   [{pdf_page:3d}/{total_pages}] avg {avg_kb:.0f}KB/trang, "
-                  f"total {total_size/1024/1024:.1f}MB")
+            print(
+                f"   [{pdf_page:3d}/{total_pages}] avg {avg_kb:.0f}KB/trang, "
+                f"total {total_size/1024/1024:.1f}MB"
+            )
 
     doc.close()
 
@@ -219,7 +271,9 @@ def convert_pdf_to_jpg(pdf_path: str, output_dir: str, subject: str, grade: int,
     max_kb = max(sizes) / 1024
     print(f"\n   ✅ Hoàn thành!")
     print(f"   📁 {total_pages} files JPG")
-    print(f"   📊 Kích thước: avg={avg_kb:.0f}KB, min={min_kb:.0f}KB, max={max_kb:.0f}KB")
+    print(
+        f"   📊 Kích thước: avg={avg_kb:.0f}KB, min={min_kb:.0f}KB, max={max_kb:.0f}KB"
+    )
     print(f"   💾 Tổng: {total_size/1024/1024:.1f}MB")
     print(f"   📄 Index: {index_path}")
     print(f"   🎯 Bài học detected: {len(index['lessons'])}")
@@ -250,29 +304,33 @@ def build_lesson_index(out_dir: Path, index: dict, subject: str, grade: int) -> 
         for book_p, pdf_p in sorted_book_pages:
             # Chỉ lấy các trang nội dung (bỏ qua trang đầu sách)
             if book_p >= 6:
-                lessons.append({
-                    "book_page":  book_p,
-                    "pdf_page":   pdf_p,
-                    "file":       f"page_{pdf_p:03d}.jpg",
-                    "title":      f"Trang {book_p}",
-                    "subject":    subject,
-                    "grade":      grade,
-                })
+                lessons.append(
+                    {
+                        "book_page": book_p,
+                        "pdf_page": pdf_p,
+                        "file": f"page_{pdf_p:03d}.jpg",
+                        "title": f"Trang {book_p}",
+                        "subject": subject,
+                        "grade": grade,
+                    }
+                )
     else:
         # Fallback: index theo pdf page (bỏ ~5 trang đầu là bìa/mục lục)
         start_content = 7  # Thường trang 7-8 trở đi là nội dung
         for pdf_page_str, meta in index["pages"].items():
             pdf_p = int(pdf_page_str)
             if pdf_p >= start_content and meta["type"] == "bai_hoc":
-                lessons.append({
-                    "book_page":  meta.get("book_page") or pdf_p,
-                    "pdf_page":   pdf_p,
-                    "file":       meta["file"],
-                    "title":      f"Trang {meta.get('book_page') or pdf_p}",
-                    "subject":    subject,
-                    "grade":      grade,
-                    "preview":    meta.get("text_preview", ""),
-                })
+                lessons.append(
+                    {
+                        "book_page": meta.get("book_page") or pdf_p,
+                        "pdf_page": pdf_p,
+                        "file": meta["file"],
+                        "title": f"Trang {meta.get('book_page') or pdf_p}",
+                        "subject": subject,
+                        "grade": grade,
+                        "preview": meta.get("text_preview", ""),
+                    }
+                )
 
     return lessons
 
@@ -282,11 +340,7 @@ def create_master_index(output_dir: str):
     out_dir = Path(output_dir)
     sgk_dir = out_dir / "sgk"
 
-    master = {
-        "version": "1.0",
-        "description": "SGK Index cho Robot AI",
-        "subjects": {}
-    }
+    master = {"version": "1.0", "description": "SGK Index cho Robot AI", "subjects": {}}
 
     if not sgk_dir.exists():
         return
@@ -302,14 +356,14 @@ def create_master_index(output_dir: str):
 
         key = subject_dir.name
         master["subjects"][key] = {
-            "subject":      idx["subject"],
+            "subject": idx["subject"],
             "subject_name": idx.get("subject_name", idx["subject"]),
-            "grade":        idx["grade"],
-            "tap":          idx["tap"],
-            "total_pages":  idx["total_pages"],
+            "grade": idx["grade"],
+            "tap": idx["tap"],
+            "total_pages": idx["total_pages"],
             "lesson_count": len(idx.get("lessons", [])),
-            "path":         f"sgk/{key}",
-            "index_file":   f"sgk/{key}/index.json",
+            "path": f"sgk/{key}",
+            "index_file": f"sgk/{key}/index.json",
         }
 
     master_path = out_dir / "master_index.json"
@@ -319,19 +373,22 @@ def create_master_index(output_dir: str):
     print(f"\n📚 Master index: {master_path}")
     print(f"   Tổng SGK: {len(master['subjects'])} cuốn")
     for key, info in master["subjects"].items():
-        print(f"   • {info['subject_name']} lớp {info['grade']} "
-              f"tập {info['tap']}: {info['total_pages']} trang")
+        print(
+            f"   • {info['subject_name']} lớp {info['grade']} "
+            f"tập {info['tap']}: {info['total_pages']} trang"
+        )
 
 
 def main():
     parser = argparse.ArgumentParser(description="Convert SGK PDF → JPG cho AI Vision")
-    parser.add_argument("--pdf",     help="Path đến file PDF")
+    parser.add_argument("--pdf", help="Path đến file PDF")
     parser.add_argument("--subject", help="Môn học: toan/tiengviet/english/khoahoc")
-    parser.add_argument("--grade",   type=int, help="Lớp: 1-5")
-    parser.add_argument("--tap",     type=int, default=1, help="Tập: 1 hoặc 2")
-    parser.add_argument("--output",  default="./SD_CARD", help="Thư mục output")
-    parser.add_argument("--all",     action="store_true",
-                        help="Convert tất cả PDF trong folder hiện tại")
+    parser.add_argument("--grade", type=int, help="Lớp: 1-5")
+    parser.add_argument("--tap", type=int, default=1, help="Tập: 1 hoặc 2")
+    parser.add_argument("--output", default="./SD_CARD", help="Thư mục output")
+    parser.add_argument(
+        "--all", action="store_true", help="Convert tất cả PDF trong folder hiện tại"
+    )
     args = parser.parse_args()
 
     output_dir = args.output
@@ -355,15 +412,15 @@ def main():
 
     elif args.pdf:
         subject = args.subject
-        grade   = args.grade
-        tap     = args.tap or 1
+        grade = args.grade
+        tap = args.tap or 1
 
         # Auto-detect nếu không truyền vào
         if not subject or not grade:
             auto_subject, auto_grade, auto_tap = detect_subject_from_filename(args.pdf)
             subject = subject or auto_subject
-            grade   = grade   or auto_grade
-            tap     = tap     or auto_tap
+            grade = grade or auto_grade
+            tap = tap or auto_tap
             print(f"🔍 Auto-detect: subject={subject}, grade={grade}, tap={tap}")
 
         convert_pdf_to_jpg(args.pdf, output_dir, subject, grade, tap)
